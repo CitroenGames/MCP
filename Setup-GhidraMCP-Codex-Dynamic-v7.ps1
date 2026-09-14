@@ -465,6 +465,7 @@ function Sync-McpRepository {
         return [pscustomobject]@{
             Dirty         = $false
             UpdateSkipped = $false
+            ReuseExisting = $false
             FreshClone    = $true
         }
     }
@@ -485,8 +486,27 @@ function Sync-McpRepository {
             return [pscustomobject]@{
                 Dirty         = $true
                 UpdateSkipped = $true
+                ReuseExisting = $false
                 FreshClone    = $false
                 DirtySummary  = $dirtyText
+            }
+        }
+
+        # A previous successful run may already have the requested release
+        # checked out. Reuse it before fetching or checking out again: this
+        # keeps reruns offline-friendly and avoids an unnecessary tag checkout
+        # failure when the installed files already match the selected release.
+        if ($Target.Mode -eq 'tag') {
+            $headCommit = (& git rev-parse --verify --quiet 'HEAD^{commit}' 2>$null | Out-String).Trim()
+            $targetCommit = (& git rev-parse --verify --quiet "refs/tags/$($Target.Ref)^{commit}" 2>$null | Out-String).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($headCommit) -and $headCommit -eq $targetCommit) {
+                Write-Ok "Existing ghidra-mcp checkout already matches $($Target.Name); reusing installed files."
+                return [pscustomobject]@{
+                    Dirty         = $false
+                    UpdateSkipped = $true
+                    ReuseExisting = $true
+                    FreshClone    = $false
+                }
             }
         }
 
@@ -496,9 +516,13 @@ function Sync-McpRepository {
             -Description "Fetching current ghidra-mcp refs"
 
         if ($Target.Mode -eq "tag") {
+            $targetCommit = (& git rev-parse --verify --quiet "refs/tags/$($Target.Ref)^{commit}" 2>$null | Out-String).Trim()
+            if ([string]::IsNullOrWhiteSpace($targetCommit)) {
+                throw "Git fetch completed, but release tag '$($Target.Ref)' is not available in the local ghidra-mcp checkout."
+            }
             Invoke-Native `
                 -FilePath "git" `
-                -Arguments @("checkout", "--force", "tags/$($Target.Ref)") `
+                -Arguments @("checkout", "--detach", "--force", $targetCommit) `
                 -Description "Checking out ghidra-mcp $($Target.Name)"
         } else {
             & git show-ref --verify --quiet "refs/heads/$($Target.Ref)"
@@ -523,6 +547,7 @@ function Sync-McpRepository {
         return [pscustomobject]@{
             Dirty         = $false
             UpdateSkipped = $false
+            ReuseExisting = $false
             FreshClone    = $false
         }
     } finally {
@@ -1439,7 +1464,10 @@ try {
     $currentCheckout = Get-CurrentMcpCheckoutIdentity
     $mcpCommit = $currentCheckout.Commit
 
-    if ($mcpSync.UpdateSkipped) {
+    if ($mcpSync.ReuseExisting) {
+        $effectiveMcpDescription = "$($currentCheckout.Description) (reused because it already matches the selected release)"
+        $effectiveMcpRef = $currentCheckout.Ref
+    } elseif ($mcpSync.UpdateSkipped) {
         $effectiveMcpDescription = "$($currentCheckout.Description) (automatic update skipped because local modifications are present)"
         $effectiveMcpRef = $currentCheckout.Ref
     } else {
@@ -1617,8 +1645,12 @@ try {
 
     # STEP 10 - Repository-supported preflight/prerequisite/build/deploy workflow.
     $deployResult = $null
-    if ($mcpSync.UpdateSkipped -and $existingDeploymentComplete) {
-        Write-WarnMsg "ghidra-mcp has local modifications, but the matching Ghidra extension and bridge are already installed."
+    if (($mcpSync.UpdateSkipped -or $mcpSync.ReuseExisting) -and $existingDeploymentComplete) {
+        if ($mcpSync.ReuseExisting) {
+            Write-Ok "The matching Ghidra extension and bridge are already installed; skipping the rebuild."
+        } else {
+            Write-WarnMsg "ghidra-mcp has local modifications, but the matching Ghidra extension and bridge are already installed."
+        }
         Write-Ok "Reusing the existing deployment instead of rebuilding or overwriting the local checkout."
 
         $deployResult = [pscustomobject]@{
