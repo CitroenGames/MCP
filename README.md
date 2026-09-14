@@ -7,7 +7,7 @@ One folder for installing and configuring MCP integrations on Windows. Choose on
 To download and launch the UI from GitHub, run this in PowerShell:
 
 ```powershell
-$zip = Join-Path $env:TEMP 'mcp-installer-hub.zip'; $destination = Join-Path $env:TEMP 'mcp-installer-hub'; irm https://github.com/CitroenGames/MCP/archive/refs/heads/main.zip -OutFile $zip; Expand-Archive -LiteralPath $zip -DestinationPath $destination -Force; & (Join-Path $destination 'MCP-main\Install-MCP-Hub.cmd')
+$zip = Join-Path $env:TEMP 'mcp-installer-hub.zip'; $destination = Join-Path $env:TEMP 'mcp-installer-hub'; irm https://github.com/CitroenGames/MCP/archive/refs/heads/master.zip -OutFile $zip; Expand-Archive -LiteralPath $zip -DestinationPath $destination -Force; & (Join-Path $destination 'MCP-master\Install-MCP-Hub.cmd')
 ```
 
 If you already cloned or downloaded this repository, run:
