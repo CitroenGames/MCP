@@ -20,8 +20,8 @@ The UI lets you select:
 
 | MCP project | What it installs | Supported client platforms |
 | --- | --- | --- |
-| Ghidra MCP | Official Ghidra version matched to `bethington/ghidra-mcp`, its extension, and the local stdio bridge | Codex, Antigravity CLI, or both |
-| Visual Studio IDE Bridge | The current `Visual-Studio-MCP` release, Visual Studio extension, and Windows bridge service | Codex, Antigravity CLI, or both |
+| Ghidra MCP | Official Ghidra version matched to `bethington/ghidra-mcp`, its extension, and the local stdio bridge | Codex, Antigravity CLI, and/or Claude Code |
+| Visual Studio IDE Bridge | The current `Visual-Studio-MCP` release, Visual Studio extension, and Windows bridge service | Codex, Antigravity CLI, and/or Claude Code |
 
 Each selected installer opens in a separate PowerShell window. Leave those windows open until they report their final verification result. The installers request UAC only when their underlying dependency requires it.
 
@@ -34,15 +34,15 @@ Each selected installer opens in a separate PowerShell window. Leave those windo
 
 ## What the installers configure
 
-Codex registrations use the Codex CLI and are read back after setup. Antigravity registrations are written into `%USERPROFILE%\.gemini\config\mcp_config.json`; an existing valid file is backed up before it changes.
+Codex registrations use its CLI and are read back after setup. Antigravity registrations are written into `%USERPROFILE%\.gemini\config\mcp_config.json`; an existing valid file is backed up before it changes. Claude Code registrations use `claude mcp` at user scope and are read back after setup.
 
 The Ghidra installer uses `C:\Tools` by default. The Visual Studio bridge uses `C:\tools` by default. Both installers accept a `-ToolsRoot` argument when run directly.
 
 ## Run one project without the UI
 
 ```powershell
-# Ghidra for both clients
-.\Setup-GhidraMCP-Codex-Dynamic-v7.ps1 -Client Both
+# Ghidra for Codex and Claude Code
+.\Setup-GhidraMCP-Codex-Dynamic-v7.ps1 -Client Codex,ClaudeCode
 
 # Visual Studio bridge for Antigravity only
 .\Setup-Visual-Studio-MCP.ps1 -Client Antigravity
@@ -50,4 +50,4 @@ The Ghidra installer uses `C:\Tools` by default. The Visual Studio bridge uses `
 
 ## Add another MCP project
 
-Keep the installer in this folder and add one checkbox plus its launch entry in `Start-MCP-Installer.ps1`. The installer should accept the shared `-Client Codex|Antigravity|Both` convention, preserve unrelated MCP entries, and verify its final configuration.
+Keep the installer in this folder and add one checkbox plus its launch entry in `Start-MCP-Installer.ps1`. The installer should accept the shared `-Client Codex,Antigravity,ClaudeCode` convention (or `-Client All`), preserve unrelated MCP entries, and verify its final configuration.

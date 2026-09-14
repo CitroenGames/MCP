@@ -8,7 +8,8 @@
       - Maven 3.9+
       - Microsoft OpenJDK 21
       - uv
-      - OpenAI Codex CLI
+      - OpenAI Codex CLI (when selected)
+      - Claude Code (when selected)
       - latest published stable bethington/ghidra-mcp release
       - the exact official Ghidra release required by that ghidra-mcp release
 
@@ -19,7 +20,7 @@
       3. Read <ghidra.version> from that checked-out pom.xml.
       4. Download the matching official NSA Ghidra release ZIP.
       5. Build/deploy ghidra-mcp against that exact Ghidra version.
-      6. Register the stdio bridge with Codex.
+      6. Register the stdio bridge with the selected MCP clients.
       7. Write instructions using the ACTUAL versions/paths installed.
 
     This avoids installing "latest Ghidra" independently when ghidra-mcp
@@ -37,8 +38,7 @@
 param(
     [string]$ToolsRoot = "C:\Tools",
     [switch]$UseMcpDefaultBranch,
-    [ValidateSet('Codex', 'Antigravity', 'Both')]
-    [string]$Client = 'Codex'
+    [string[]]$Client = @('Codex')
 )
 
 Set-StrictMode -Version Latest
@@ -55,6 +55,28 @@ $GhidraRepoName  = "ghidra"
 $McpPath          = Join-Path $ToolsRoot "ghidra-mcp"
 $InstructionsPath = Join-Path $ToolsRoot "GHIDRA_MCP_CODEX_INSTRUCTIONS.txt"
 $LogPath          = Join-Path $ToolsRoot "GHIDRA_MCP_SETUP.log"
+
+function Test-SelectedClient {
+    param([Parameter(Mandatory)][string]$Name)
+
+    $selectedClients = @($Client | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    return $selectedClients -contains $Name -or
+        ($Name -in @('Codex', 'Antigravity') -and $selectedClients -contains 'Both') -or
+        $selectedClients -contains 'All'
+}
+
+function Assert-SelectedClients {
+    $validClients = @('Codex', 'Antigravity', 'ClaudeCode', 'Both', 'All')
+    $requestedClients = @($Client | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if ($requestedClients.Count -eq 0) {
+        throw 'Choose at least one client: Codex, Antigravity, or ClaudeCode.'
+    }
+    $invalidClients = @($requestedClients |
+        Where-Object { $_ -and $_ -notin $validClients })
+    if ($invalidClients.Count -gt 0) {
+        throw "Unknown client selection: $($invalidClients -join ', '). Choose Codex, Antigravity, ClaudeCode, or All."
+    }
+}
 
 function Write-Step {
     param([Parameter(Mandatory)][string]$Message)
@@ -806,8 +828,9 @@ function ConvertTo-CmdQuotedArgument {
     return '"' + ($Value -replace '"', '""') + '"'
 }
 
-function Invoke-CodexCapture {
+function Invoke-CommandCapture {
     param(
+        [Parameter(Mandatory)][string]$CommandName,
         [Parameter(Mandatory)][string[]]$Arguments
     )
 
@@ -815,24 +838,24 @@ function Invoke-CodexCapture {
     $stderrFile = [System.IO.Path]::GetTempFileName()
 
     try {
-        $codexCommand = Get-Command codex -ErrorAction Stop | Select-Object -First 1
-        $codexPath = $codexCommand.Source
+        $command = Get-Command $CommandName -ErrorAction Stop | Select-Object -First 1
+        $commandPath = $command.Source
 
-        if ([string]::IsNullOrWhiteSpace($codexPath)) {
-            $codexPath = $codexCommand.Path
+        if ([string]::IsNullOrWhiteSpace($commandPath)) {
+            $commandPath = $command.Path
         }
 
-        if ([string]::IsNullOrWhiteSpace($codexPath)) {
-            throw "The 'codex' command was found, but its executable/script path could not be resolved."
+        if ([string]::IsNullOrWhiteSpace($commandPath)) {
+            throw "The '$CommandName' command was found, but its executable/script path could not be resolved."
         }
 
-        $extension = [System.IO.Path]::GetExtension($codexPath).ToLowerInvariant()
+        $extension = [System.IO.Path]::GetExtension($commandPath).ToLowerInvariant()
 
         if ($extension -eq ".cmd" -or $extension -eq ".bat") {
-            # npm installs Codex on Windows as a .cmd shim. Start-Process cannot
+            # npm installs many CLIs on Windows as a .cmd shim. Start-Process cannot
             # execute that shim directly when output redirection is enabled, so
             # invoke it through cmd.exe.
-            $parts = @((ConvertTo-CmdQuotedArgument $codexPath))
+            $parts = @((ConvertTo-CmdQuotedArgument $commandPath))
             foreach ($argValue in $Arguments) {
                 $parts += (ConvertTo-CmdQuotedArgument $argValue)
             }
@@ -854,7 +877,7 @@ function Invoke-CodexCapture {
                 "-NoProfile",
                 "-NonInteractive",
                 "-ExecutionPolicy", "Bypass",
-                "-File", $codexPath
+                "-File", $commandPath
             ) + $Arguments
 
             $proc = Start-Process `
@@ -869,7 +892,7 @@ function Invoke-CodexCapture {
         else {
             # Native executable case.
             $proc = Start-Process `
-                -FilePath $codexPath `
+                -FilePath $commandPath `
                 -ArgumentList $Arguments `
                 -NoNewWindow `
                 -Wait `
@@ -893,12 +916,22 @@ function Invoke-CodexCapture {
             ExitCode = $proc.ExitCode
             StdOut   = $stdout
             StdErr   = $stderr
-            Command  = $codexPath
+            Command  = $commandPath
         }
     } finally {
         Remove-Item -LiteralPath $stdoutFile -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $stderrFile -Force -ErrorAction SilentlyContinue
     }
+}
+
+function Invoke-CodexCapture {
+    param([Parameter(Mandatory)][string[]]$Arguments)
+    return Invoke-CommandCapture -CommandName 'codex' -Arguments $Arguments
+}
+
+function Invoke-ClaudeCapture {
+    param([Parameter(Mandatory)][string[]]$Arguments)
+    return Invoke-CommandCapture -CommandName 'claude' -Arguments $Arguments
 }
 
 function Test-CodexMcpRegistration {
@@ -972,6 +1005,33 @@ function Ensure-CodexMcpRegistration {
     }
 
     Write-Ok "Codex MCP registration verified."
+}
+
+function Ensure-ClaudeCodeMcpRegistration {
+    Write-Step "Registering ghidra MCP bridge with Claude Code"
+
+    $existing = Invoke-ClaudeCapture -Arguments @('mcp', 'get', 'ghidra')
+    if ($existing.ExitCode -eq 0) {
+        $remove = Invoke-ClaudeCapture -Arguments @('mcp', 'remove', 'ghidra', '--scope', 'user')
+        if ($remove.ExitCode -ne 0) {
+            throw "Could not remove existing Claude Code MCP registration 'ghidra'. Output: $($remove.StdOut)`n$($remove.StdErr)"
+        }
+    }
+
+    $add = Invoke-ClaudeCapture -Arguments @(
+        'mcp', 'add', 'ghidra', '--scope', 'user', '--',
+        'uv', 'run', '--directory', $McpPath, 'bridge-mcp-ghidra'
+    )
+    if ($add.ExitCode -ne 0) {
+        throw "Adding Claude Code MCP registration 'ghidra' failed. Output: $($add.StdOut)`n$($add.StdErr)"
+    }
+
+    $readback = Invoke-ClaudeCapture -Arguments @('mcp', 'get', 'ghidra')
+    if ($readback.ExitCode -ne 0) {
+        throw "Claude Code MCP registration was added, but could not be read back. Output: $($readback.StdOut)`n$($readback.StdErr)"
+    }
+    if ($readback.StdOut) { Write-Host $readback.StdOut.TrimEnd() }
+    Write-Ok 'Claude Code MCP registration verified at user scope.'
 }
 
 function Set-AntigravityGhidraConfiguration {
@@ -1104,7 +1164,7 @@ WHAT THE INSTALLER ALREADY DID
 4. Installed/validated Maven 3.9+.
 5. Installed/located OpenJDK 21 and pinned JAVA_HOME to the exact JDK used.
 6. Installed/validated uv.
-7. Installed/validated Codex CLI.
+7. Installed/validated the selected MCP client CLIs.
 8. Selected $McpTargetDescription.
 9. Checked out ghidra-mcp ref '$McpRef'.
 10. Read Ghidra version '$GhidraVersion' from:
@@ -1115,7 +1175,7 @@ WHAT THE INSTALLER ALREADY DID
     python -m tools.setup ensure-prereqs --ghidra-path "$GhidraPath"
     python -m tools.setup build
     python -m tools.setup deploy --ghidra-path "$GhidraPath"
-13. Registered this stdio bridge with Codex:
+13. Registered this stdio bridge with the selected clients:
     uv run --directory "$McpPath" bridge-mcp-ghidra
 
 $(if ($NeedsProject) {
@@ -1192,29 +1252,32 @@ Optional version check:
 curl.exe http://127.0.0.1:8089/get_version
 
 
-VALIDATE THE CODEX MCP REGISTRATION
+VALIDATE THE MCP CLIENT REGISTRATION
 -----------------------------------
 In PowerShell:
 
-codex mcp list
+$(if (Test-SelectedClient -Name 'Codex') { 'codex mcp list' })
 
 Then:
 
-codex mcp get ghidra --json
+$(if (Test-SelectedClient -Name 'Codex') { 'codex mcp get ghidra --json' })
+$(if ((Test-SelectedClient -Name 'Codex') -and (Test-SelectedClient -Name 'ClaudeCode')) { "`r`nOr, for Claude Code:" })
+$(if (Test-SelectedClient -Name 'ClaudeCode') { 'claude mcp get ghidra' })
 
 The registered command should resolve to the ghidra-mcp checkout at:
 
 $McpPath
 
 
-USE GHIDRA FROM CODEX
+USE GHIDRA FROM YOUR SELECTED CLIENT
 ---------------------
 1. Keep Ghidra open.
 2. Keep the game EXE open in Ghidra.
 3. Make sure the GhidraMCP server is started.
-4. Start Codex:
+4. Start your selected client, for example:
 
-   codex
+$(if (Test-SelectedClient -Name 'Codex') { '   codex' })
+$(if (Test-SelectedClient -Name 'ClaudeCode') { '   claude' })
 
 5. First read-only test prompt:
 
@@ -1320,11 +1383,13 @@ if (-not $isAdmin) {
     if ($UseMcpDefaultBranch) {
         $relaunchArgs += "-UseMcpDefaultBranch"
     }
+    $relaunchArgs += "-Client", ('"{0}"' -f ($Client -join ','))
 
     Start-Process powershell.exe -Verb RunAs -ArgumentList $relaunchArgs
     exit
 }
 
+Assert-SelectedClients
 New-Item -ItemType Directory -Path $ToolsRoot -Force | Out-Null
 
 try {
@@ -1492,8 +1557,8 @@ try {
     }
     Write-Ok "uv is available."
 
-    # STEP 8 - Codex CLI (only needed when Codex was selected).
-    if (($Client -eq 'Codex' -or $Client -eq 'Both') -and -not (Test-Command codex)) {
+    # STEP 8 - MCP client CLIs (only needed for selected CLI-managed clients).
+    if ((Test-SelectedClient -Name 'Codex') -and -not (Test-Command codex)) {
         Install-ChocoPackageIfMissing -Package "nodejs-lts" -Command "npm"
 
         Invoke-Native `
@@ -1515,8 +1580,28 @@ try {
             throw "Codex CLI installation succeeded, but 'codex' is still unavailable in PATH."
         }
     }
-    if ($Client -eq 'Codex' -or $Client -eq 'Both') {
+    if (Test-SelectedClient -Name 'Codex') {
         Write-Ok "Codex CLI is available."
+    }
+    if ((Test-SelectedClient -Name 'ClaudeCode') -and -not (Test-Command claude)) {
+        Install-ChocoPackageIfMissing -Package "nodejs-lts" -Command "npm"
+        Invoke-Native `
+            -FilePath "npm" `
+            -Arguments @("install", "-g", "@anthropic-ai/claude-code") `
+            -Description "Installing Anthropic Claude Code"
+        Refresh-Environment
+        if (-not (Test-Command claude)) {
+            $npmPrefix = (& npm prefix -g 2>$null | Out-String).Trim()
+            if ($npmPrefix -and (Test-Path $npmPrefix)) {
+                $env:Path = "$npmPrefix;$env:Path"
+            }
+        }
+        if (-not (Test-Command claude)) {
+            throw "Claude Code installation succeeded, but 'claude' is still unavailable in PATH."
+        }
+    }
+    if (Test-SelectedClient -Name 'ClaudeCode') {
+        Write-Ok "Claude Code is available."
     }
 
     # STEP 9 - Download/reuse EXACT Ghidra version required by pom.xml.
@@ -1580,11 +1665,14 @@ try {
     }
 
     # STEP 11 - Register the selected MCP clients.
-    if ($Client -eq 'Codex' -or $Client -eq 'Both') {
+    if (Test-SelectedClient -Name 'Codex') {
         Ensure-CodexMcpRegistration
     }
-    if ($Client -eq 'Antigravity' -or $Client -eq 'Both') {
+    if (Test-SelectedClient -Name 'Antigravity') {
         Set-AntigravityGhidraConfiguration
+    }
+    if (Test-SelectedClient -Name 'ClaudeCode') {
+        Ensure-ClaudeCodeMcpRegistration
     }
 
     # STEP 12 - Final verification of paths/files before calling setup complete.
@@ -1622,6 +1710,10 @@ try {
     try {
         $codexResolved = Get-Command codex -ErrorAction Stop | Select-Object -First 1
         Write-Host "Codex cmd:    $($codexResolved.Source)"
+    } catch {}
+    try {
+        $claudeResolved = Get-Command claude -ErrorAction Stop | Select-Object -First 1
+        Write-Host "Claude cmd:   $($claudeResolved.Source)"
     } catch {}
     if ($deployResult -and $deployResult.NeedsProject) {
         Write-Host "Next action:  Create/open a Ghidra project and import your EXE." -ForegroundColor Yellow

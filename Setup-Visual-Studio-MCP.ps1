@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-Installs VS IDE Bridge under C:\tools and configures Codex, Antigravity CLI, or both to use it over STDIO.
+Installs VS IDE Bridge under C:\tools and configures selected MCP clients to use it over STDIO.
 
 .DESCRIPTION
 The script:
@@ -20,8 +20,7 @@ through UAC because the upstream installer creates a Windows service.
 param(
     [string]$ToolsRoot = 'C:\tools',
     [string]$CodexHome = '',
-    [ValidateSet('Codex', 'Antigravity', 'Both')]
-    [string]$Client = 'Codex',
+    [string[]]$Client = @('Codex'),
     [switch]$SkipSourceClone,
     [switch]$Help
 )
@@ -34,6 +33,28 @@ $ReleaseApiUrl = 'https://api.github.com/repos/RenegadeRiff86/Visual-Studio-MCP/
 $MinimumVisualStudioVersion = [Version]'17.14'
 $DownloadRetryCount = 3
 
+function Test-SelectedClient {
+    param([Parameter(Mandatory)][string]$Name)
+
+    $selectedClients = @($Client | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    return $selectedClients -contains $Name -or
+        ($Name -in @('Codex', 'Antigravity') -and $selectedClients -contains 'Both') -or
+        $selectedClients -contains 'All'
+}
+
+function Assert-SelectedClients {
+    $validClients = @('Codex', 'Antigravity', 'ClaudeCode', 'Both', 'All')
+    $requestedClients = @($Client | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if ($requestedClients.Count -eq 0) {
+        throw 'Choose at least one client: Codex, Antigravity, or ClaudeCode.'
+    }
+    $invalidClients = @($requestedClients |
+        Where-Object { $_ -and $_ -notin $validClients })
+    if ($invalidClients.Count -gt 0) {
+        throw "Unknown client selection: $($invalidClients -join ', '). Choose Codex, Antigravity, ClaudeCode, or All."
+    }
+}
+
 function Write-Step {
     param([string]$Message)
     Write-Host "`n==> $Message" -ForegroundColor Cyan
@@ -41,12 +62,13 @@ function Write-Step {
 
 function Show-Usage {
     @'
-VS IDE Bridge setup for Codex and Antigravity CLI
+VS IDE Bridge setup for Codex, Antigravity CLI, and Claude Code
 
 Usage:
   .\Setup-Visual-Studio-MCP.ps1
   .\Setup-Visual-Studio-MCP.ps1 -Client Antigravity
-  .\Setup-Visual-Studio-MCP.ps1 -Client Both
+  .\Setup-Visual-Studio-MCP.ps1 -Client Codex,ClaudeCode
+  .\Setup-Visual-Studio-MCP.ps1 -Client All
   .\Setup-Visual-Studio-MCP.ps1 -SkipSourceClone
   .\Setup-Visual-Studio-MCP.ps1 -ToolsRoot D:\tools
 
@@ -56,6 +78,7 @@ Defaults:
   Setup:    C:\tools\Visual-Studio-MCP-setup
   Config:   %USERPROFILE%\.codex\config.toml
   Antigravity config: %USERPROFILE%\.gemini\config\mcp_config.json
+  Claude Code: user-scoped MCP configuration managed by the claude CLI
 
 Close Visual Studio before running. Approve the UAC prompt when requested.
 '@ | Write-Host
@@ -72,7 +95,7 @@ function Invoke-SelfElevated {
         [string]$ScriptPath,
         [string]$ResolvedToolsRoot,
         [string]$ResolvedCodexHome,
-        [string]$SelectedClient,
+        [string[]]$SelectedClient,
         [bool]$ShouldSkipSourceClone
     )
 
@@ -107,7 +130,7 @@ $data = $json | ConvertFrom-Json
 $innerTemplate = @(
     '$json = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(''__INNER_PAYLOAD__''))',
     '$data = $json | ConvertFrom-Json',
-    '$childParameters = @{ ToolsRoot = [string]$data.ToolsRoot; CodexHome = [string]$data.CodexHome; Client = [string]$data.Client }',
+    '$childParameters = @{ ToolsRoot = [string]$data.ToolsRoot; CodexHome = [string]$data.CodexHome; Client = @($data.Client | ForEach-Object { [string]$_ }) }',
     'if ([bool]$data.SkipSourceClone) { $childParameters.SkipSourceClone = $true }',
     '& ([string]$data.ScriptPath) @childParameters'
 ) -join [Environment]::NewLine
@@ -613,6 +636,57 @@ function Set-AntigravityBridgeConfiguration {
     return $configPath
 }
 
+function Invoke-ClaudeCapture {
+    param([Parameter(Mandatory)][string[]]$Arguments)
+
+    $claudeCommand = Get-Command claude -ErrorAction Stop | Select-Object -First 1
+    $claudePath = if ($claudeCommand.Source) { $claudeCommand.Source } else { $claudeCommand.Path }
+    if ([string]::IsNullOrWhiteSpace($claudePath)) {
+        throw "The 'claude' command was found, but its executable/script path could not be resolved."
+    }
+
+    $output = & $claudePath @Arguments 2>&1 | Out-String
+    return [pscustomobject]@{
+        ExitCode = $LASTEXITCODE
+        Output = $output
+        Command = $claudePath
+    }
+}
+
+function Set-ClaudeCodeBridgeConfiguration {
+    param([string]$ServiceExecutable)
+
+    Write-Step 'Configuring Claude Code STDIO transport'
+    if ($null -eq (Get-Command claude -ErrorAction SilentlyContinue)) {
+        throw "Claude Code is not available in PATH. Install it first, then rerun with -Client ClaudeCode. See https://docs.anthropic.com/en/docs/claude-code/getting-started"
+    }
+
+    $existing = Invoke-ClaudeCapture -Arguments @('mcp', 'get', 'vs-ide-bridge')
+    if ($existing.ExitCode -eq 0) {
+        $remove = Invoke-ClaudeCapture -Arguments @('mcp', 'remove', 'vs-ide-bridge', '--scope', 'user')
+        if ($remove.ExitCode -ne 0) {
+            throw "Could not remove the existing Claude Code MCP registration 'vs-ide-bridge'. Output: $($remove.Output)"
+        }
+    }
+
+    $add = Invoke-ClaudeCapture -Arguments @(
+        'mcp', 'add', 'vs-ide-bridge', '--scope', 'user', '--',
+        $ServiceExecutable, 'mcp-server'
+    )
+    if ($add.ExitCode -ne 0) {
+        throw "Adding Claude Code MCP registration 'vs-ide-bridge' failed. Output: $($add.Output)"
+    }
+
+    $readback = Invoke-ClaudeCapture -Arguments @('mcp', 'get', 'vs-ide-bridge')
+    if ($readback.ExitCode -ne 0) {
+        throw "Claude Code MCP registration was added, but could not be read back. Output: $($readback.Output)"
+    }
+
+    Write-Host $readback.Output.TrimEnd()
+    Write-Host 'Claude Code MCP registration verified at user scope.'
+    return 'Claude Code user MCP configuration'
+}
+
 function Test-StdioHandshake {
     param([string]$ServiceExecutable)
 
@@ -700,6 +774,7 @@ function Test-StdioHandshake {
 }
 
 function Main {
+    Assert-SelectedClients
     Normalize-SetupPaths
 
     if (-not [Environment]::Is64BitOperatingSystem) {
@@ -725,13 +800,17 @@ function Main {
     Install-SourceSnapshot -Release $release
     $serviceExecutable = Install-Bridge -InstallerPath $installerPath -ReleaseTag $release.Tag
     $configuredClients = New-Object System.Collections.Generic.List[string]
-    if ($Client -eq 'Codex' -or $Client -eq 'Both') {
+    if (Test-SelectedClient -Name 'Codex') {
         $configPath = Set-CodexBridgeConfiguration -ServiceExecutable $serviceExecutable
         $configuredClients.Add("Codex: $configPath")
     }
-    if ($Client -eq 'Antigravity' -or $Client -eq 'Both') {
+    if (Test-SelectedClient -Name 'Antigravity') {
         $antigravityConfigPath = Set-AntigravityBridgeConfiguration -ServiceExecutable $serviceExecutable
         $configuredClients.Add("Antigravity CLI: $antigravityConfigPath")
+    }
+    if (Test-SelectedClient -Name 'ClaudeCode') {
+        $claudeCodeConfig = Set-ClaudeCodeBridgeConfiguration -ServiceExecutable $serviceExecutable
+        $configuredClients.Add("Claude Code: $claudeCodeConfig")
     }
     Test-StdioHandshake -ServiceExecutable $serviceExecutable
 

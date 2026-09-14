@@ -82,24 +82,24 @@ $clients.Location = New-Object Drawing.Point(24, 228)
 $clients.Size = New-Object Drawing.Size(540, 72)
 $form.Controls.Add($clients)
 
-$codex = New-Object Windows.Forms.RadioButton
+$codex = New-Object Windows.Forms.CheckBox
 $codex.Text = 'Codex'
 $codex.AutoSize = $true
 $codex.Location = New-Object Drawing.Point(18, 30)
 $codex.Checked = $true
 $clients.Controls.Add($codex)
 
-$antigravity = New-Object Windows.Forms.RadioButton
+$antigravity = New-Object Windows.Forms.CheckBox
 $antigravity.Text = 'Antigravity CLI'
 $antigravity.AutoSize = $true
 $antigravity.Location = New-Object Drawing.Point(155, 30)
 $clients.Controls.Add($antigravity)
 
-$both = New-Object Windows.Forms.RadioButton
-$both.Text = 'Both'
-$both.AutoSize = $true
-$both.Location = New-Object Drawing.Point(350, 30)
-$clients.Controls.Add($both)
+$claudeCode = New-Object Windows.Forms.CheckBox
+$claudeCode.Text = 'Claude Code'
+$claudeCode.AutoSize = $true
+$claudeCode.Location = New-Object Drawing.Point(350, 30)
+$clients.Controls.Add($claudeCode)
 
 $install = New-Object Windows.Forms.Button
 $install.Text = 'Run selected installers'
@@ -123,15 +123,23 @@ if (-not $ghidra.Checked -and -not $vs.Checked) {
     exit 1
 }
 
-$client = if ($both.Checked) { 'Both' } elseif ($antigravity.Checked) { 'Antigravity' } else { 'Codex' }
+$selectedClients = @()
+if ($codex.Checked) { $selectedClients += 'Codex' }
+if ($antigravity.Checked) { $selectedClients += 'Antigravity' }
+if ($claudeCode.Checked) { $selectedClients += 'ClaudeCode' }
+if ($selectedClients.Count -eq 0) {
+    [Windows.Forms.MessageBox]::Show('Choose at least one client platform.', 'MCP Installer Hub', 'OK', 'Warning') | Out-Null
+    exit 1
+}
 $powerShell = (Get-Process -Id $PID).Path
 if ([string]::IsNullOrWhiteSpace($powerShell)) { $powerShell = 'powershell.exe' }
 
 function Start-InstallerConsole {
-    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Client)
-    $command = "& '$Path' -Client '$Client'"
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string[]]$Client)
+    $clientArguments = ($Client | ForEach-Object { "'$_'" }) -join ','
+    $command = "& '$Path' -Client $clientArguments"
     Start-Process -FilePath $powerShell -ArgumentList @('-NoExit', '-NoLogo', '-ExecutionPolicy', 'Bypass', '-Command', $command) -WorkingDirectory $root
 }
 
-if ($ghidra.Checked) { Start-InstallerConsole -Path $ghidraInstaller -Client $client }
-if ($vs.Checked) { Start-InstallerConsole -Path $visualStudioInstaller -Client $client }
+if ($ghidra.Checked) { Start-InstallerConsole -Path $ghidraInstaller -Client $selectedClients }
+if ($vs.Checked) { Start-InstallerConsole -Path $visualStudioInstaller -Client $selectedClients }

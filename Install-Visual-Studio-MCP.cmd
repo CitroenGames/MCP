@@ -8,18 +8,21 @@ if not exist "%SETUP_SCRIPT%" (
   exit /b 1
 )
 
-echo VS IDE Bridge setup for Codex and Antigravity CLI
+echo VS IDE Bridge setup for Codex, Antigravity CLI, and Claude Code
 echo Close Visual Studio before continuing. A Windows UAC prompt will appear.
 echo.
 
 echo Choose the MCP client to configure:
 echo   1. Codex
 echo   2. Antigravity CLI
-echo   3. Both Codex and Antigravity CLI
+echo   3. Claude Code
+echo   4. All three clients
 echo.
-choice /C 123 /N /M "Enter 1, 2, or 3: "
-if errorlevel 3 (
-  set "SETUP_CLIENT=Both"
+choice /C 1234 /N /M "Enter 1, 2, 3, or 4: "
+if errorlevel 4 (
+  set "SETUP_CLIENT=All"
+) else if errorlevel 3 (
+  set "SETUP_CLIENT=ClaudeCode"
 ) else if errorlevel 2 (
   set "SETUP_CLIENT=Antigravity"
 ) else (
