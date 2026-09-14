@@ -10,13 +10,13 @@
       - uv
       - OpenAI Codex CLI (when selected)
       - Claude Code (when selected)
-      - latest published stable bethington/ghidra-mcp release
+      - CitroenGames/ghidra-mcp default branch
       - the exact official Ghidra release required by that ghidra-mcp release
 
 .DESCRIPTION
     The important compatibility rule is:
-      1. Find the latest published ghidra-mcp release.
-      2. Clone/update ghidra-mcp to that release tag.
+      1. Resolve the CitroenGames/ghidra-mcp default branch.
+      2. Clone/update ghidra-mcp to that branch.
       3. Read <ghidra.version> from that checked-out pom.xml.
       4. Download the matching official NSA Ghidra release ZIP.
       5. Build/deploy ghidra-mcp against that exact Ghidra version.
@@ -38,6 +38,7 @@
 param(
     [string]$ToolsRoot = "C:\Tools",
     [switch]$UseMcpDefaultBranch,
+    [switch]$ForceUpdate,
     [string[]]$Client = @('Codex')
 )
 
@@ -45,7 +46,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
-$McpRepoOwner = "bethington"
+$McpRepoOwner = "CitroenGames"
 $McpRepoName  = "ghidra-mcp"
 $McpRepoUrl   = "https://github.com/$McpRepoOwner/$McpRepoName.git"
 
@@ -412,32 +413,7 @@ function Get-XmlElementValue {
 }
 
 function Get-McpTarget {
-    if ($UseMcpDefaultBranch) {
-        Write-Step "Resolving ghidra-mcp default branch"
-        $repo = Invoke-GitHubApi "https://api.github.com/repos/$McpRepoOwner/$McpRepoName"
-        return [pscustomobject]@{
-            Mode = "branch"
-            Ref  = $repo.default_branch
-            Name = "default branch '$($repo.default_branch)'"
-        }
-    }
-
-    Write-Step "Resolving latest published stable ghidra-mcp release"
-
-    try {
-        $release = Invoke-GitHubApi "https://api.github.com/repos/$McpRepoOwner/$McpRepoName/releases/latest"
-
-        if ($release -and $release.tag_name) {
-            return [pscustomobject]@{
-                Mode = "tag"
-                Ref  = [string]$release.tag_name
-                Name = "release $($release.tag_name)"
-            }
-        }
-    } catch {
-        Write-WarnMsg "No usable published ghidra-mcp release was returned; falling back to the repository default branch."
-    }
-
+    Write-Step "Resolving CitroenGames/ghidra-mcp default branch"
     $repo = Invoke-GitHubApi "https://api.github.com/repos/$McpRepoOwner/$McpRepoName"
     return [pscustomobject]@{
         Mode = "branch"
@@ -497,6 +473,32 @@ function Sync-McpRepository {
         # keeps reruns offline-friendly and avoids an unnecessary tag checkout
         # failure when the installed files already match the selected release.
         if ($Target.Mode -eq 'tag') {
+            # A shallow or otherwise incomplete checkout can lack the release
+            # tag even though its manifest and the deployed extension already
+            # match the requested release. In that case the installed files
+            # are stronger evidence than a missing local ref, so reuse them.
+            $pomPath = Join-Path $McpPath 'pom.xml'
+            if (Test-Path -LiteralPath $pomPath) {
+                $installedMcpVersion = Get-XmlElementValue -XmlPath $pomPath -LocalName 'version'
+                $installedGhidraVersion = Get-XmlElementValue -XmlPath $pomPath -LocalName 'ghidra.version'
+                $expectedTag = if ([string]::IsNullOrWhiteSpace($installedMcpVersion)) { '' } else { "v$installedMcpVersion" }
+                $installedGhidraPath = if ([string]::IsNullOrWhiteSpace($installedGhidraVersion)) { '' } else {
+                    Join-Path $ToolsRoot "ghidra_$($installedGhidraVersion)_PUBLIC"
+                }
+
+                if ($expectedTag -eq $Target.Ref -and (Test-Path -LiteralPath $installedGhidraPath) -and
+                    (Test-ExistingMcpDeployment -GhidraPath $installedGhidraPath `
+                        -GhidraVersion $installedGhidraVersion -McpVersion $installedMcpVersion)) {
+                    Write-Ok "Installed ghidra-mcp $installedMcpVersion and its matching Ghidra deployment are complete; reusing installed files."
+                    return [pscustomobject]@{
+                        Dirty         = $false
+                        UpdateSkipped = $true
+                        ReuseExisting = $true
+                        FreshClone    = $false
+                    }
+                }
+            }
+
             $headCommit = (& git rev-parse --verify --quiet 'HEAD^{commit}' 2>$null | Out-String).Trim()
             $targetCommit = (& git rev-parse --verify --quiet "refs/tags/$($Target.Ref)^{commit}" 2>$null | Out-String).Trim()
             if (-not [string]::IsNullOrWhiteSpace($headCommit) -and $headCommit -eq $targetCommit) {
@@ -560,7 +562,9 @@ function Get-CurrentMcpCheckoutIdentity {
     try {
         $commit = (& git rev-parse HEAD | Out-String).Trim()
 
-        $exactTag = (& git describe --tags --exact-match HEAD 2>$null | Out-String).Trim()
+        # `git describe --exact-match` writes an error when a shallow clone has
+        # no tags; `git tag --points-at` returns an empty successful result.
+        $exactTag = (& git tag --points-at HEAD | Select-Object -First 1 | Out-String).Trim()
         if (-not [string]::IsNullOrWhiteSpace($exactTag)) {
             return [pscustomobject]@{
                 Ref         = $exactTag
@@ -614,6 +618,48 @@ function Test-ExistingMcpDeployment {
         $wheel -and
         (Test-Path $userExtension)
     )
+}
+
+function Get-CompleteInstalledMcpDeployment {
+    if (-not (Test-Path -LiteralPath (Join-Path $McpPath '.git')) -or
+        -not (Test-Path -LiteralPath (Join-Path $McpPath 'pom.xml'))) {
+        return $null
+    }
+
+    Push-Location $McpPath
+    try {
+        $origin = (& git config --get remote.origin.url 2>$null | Out-String).Trim()
+    } finally {
+        Pop-Location
+    }
+    $normalizeOrigin = {
+        param([string]$Value)
+        return $Value.Trim().TrimEnd('/') -replace '(?i)\.git$', ''
+    }
+    if ([string]::IsNullOrWhiteSpace($origin) -or
+        (& $normalizeOrigin $origin) -ne (& $normalizeOrigin $McpRepoUrl)) {
+        return $null
+    }
+
+    $pomPath = Join-Path $McpPath 'pom.xml'
+    $mcpVersion = Get-XmlElementValue -XmlPath $pomPath -LocalName 'version'
+    $ghidraVersion = Get-XmlElementValue -XmlPath $pomPath -LocalName 'ghidra.version'
+    if ([string]::IsNullOrWhiteSpace($mcpVersion) -or [string]::IsNullOrWhiteSpace($ghidraVersion)) {
+        return $null
+    }
+
+    $ghidraPath = Join-Path $ToolsRoot "ghidra_${ghidraVersion}_PUBLIC"
+    if (-not (Test-Path -LiteralPath $ghidraPath) -or
+        -not (Test-ExistingMcpDeployment -GhidraPath $ghidraPath -GhidraVersion $ghidraVersion -McpVersion $mcpVersion)) {
+        return $null
+    }
+
+    return [pscustomobject]@{
+        Checkout = Get-CurrentMcpCheckoutIdentity
+        McpVersion = $mcpVersion
+        GhidraVersion = $ghidraVersion
+        GhidraPath = $ghidraPath
+    }
 }
 
 function Get-GhidraReleaseForVersion {
@@ -1334,8 +1380,8 @@ UPDATING LATER
 Rerun the SAME installer script.
 
 On each rerun it will:
-1. Ask GitHub for the latest published stable ghidra-mcp release.
-2. Update the ghidra-mcp checkout to that release when the working tree is clean.
+1. Reuse a complete CitroenGames/ghidra-mcp deployment when it is already installed.
+2. Otherwise ask GitHub for the CitroenGames/ghidra-mcp default branch and update the checkout when the working tree is clean.
    If local modifications exist, preserve them and reuse the current checkout.
 3. Read the Ghidra version required by the checkout actually being used from pom.xml.
 4. Download that matching official Ghidra release if it is not already in
@@ -1408,6 +1454,9 @@ if (-not $isAdmin) {
     if ($UseMcpDefaultBranch) {
         $relaunchArgs += "-UseMcpDefaultBranch"
     }
+    if ($ForceUpdate) {
+        $relaunchArgs += "-ForceUpdate"
+    }
     $relaunchArgs += "-Client", ('"{0}"' -f ($Client -join ','))
 
     Start-Process powershell.exe -Verb RunAs -ArgumentList $relaunchArgs
@@ -1453,35 +1502,51 @@ try {
     # STEP 2 - Git
     Install-ChocoPackageIfMissing -Package "git" -Command "git"
 
-    # STEP 3 - Select/sync latest stable ghidra-mcp now that Git is available.
-    $mcpTarget = Get-McpTarget
-    $mcpSync = Sync-McpRepository -Target $mcpTarget
-
-    if (-not (Test-Path (Join-Path $McpPath "pom.xml"))) {
-        throw "The ghidra-mcp checkout is missing pom.xml."
-    }
-
-    $currentCheckout = Get-CurrentMcpCheckoutIdentity
-    $mcpCommit = $currentCheckout.Commit
-
-    if ($mcpSync.ReuseExisting) {
-        $effectiveMcpDescription = "$($currentCheckout.Description) (reused because it already matches the selected release)"
+    # STEP 3 - Reuse a complete compatible deployment before querying or
+    # updating GitHub. Use -ForceUpdate when an explicit upgrade is wanted.
+    $installedDeployment = if ($ForceUpdate) { $null } else { Get-CompleteInstalledMcpDeployment }
+    if ($installedDeployment) {
+        Write-Ok "Found a complete installed ghidra-mcp deployment from $($installedDeployment.Checkout.Description)."
+        $mcpTarget = [pscustomobject]@{ Mode = 'installed'; Ref = $installedDeployment.Checkout.Ref; Name = 'installed compatible deployment' }
+        $mcpSync = [pscustomobject]@{ Dirty = $false; UpdateSkipped = $true; ReuseExisting = $true; FreshClone = $false }
+        $currentCheckout = $installedDeployment.Checkout
+        $mcpCommit = $currentCheckout.Commit
+        $effectiveMcpDescription = "$($currentCheckout.Description) (reused because the deployed files are complete)"
         $effectiveMcpRef = $currentCheckout.Ref
-    } elseif ($mcpSync.UpdateSkipped) {
-        $effectiveMcpDescription = "$($currentCheckout.Description) (automatic update skipped because local modifications are present)"
-        $effectiveMcpRef = $currentCheckout.Ref
+        $requiredGhidraVersion = $installedDeployment.GhidraVersion
+        $mcpProjectVersion = $installedDeployment.McpVersion
+        $reuseInstalledDeployment = $true
     } else {
-        $effectiveMcpDescription = $mcpTarget.Name
-        $effectiveMcpRef = $mcpTarget.Ref
+        $mcpTarget = Get-McpTarget
+        $mcpSync = Sync-McpRepository -Target $mcpTarget
+
+        if (-not (Test-Path (Join-Path $McpPath "pom.xml"))) {
+            throw "The ghidra-mcp checkout is missing pom.xml."
+        }
+
+        $currentCheckout = Get-CurrentMcpCheckoutIdentity
+        $mcpCommit = $currentCheckout.Commit
+
+        if ($mcpSync.ReuseExisting) {
+            $effectiveMcpDescription = "$($currentCheckout.Description) (reused because it already matches the selected release)"
+            $effectiveMcpRef = $currentCheckout.Ref
+        } elseif ($mcpSync.UpdateSkipped) {
+            $effectiveMcpDescription = "$($currentCheckout.Description) (automatic update skipped because local modifications are present)"
+            $effectiveMcpRef = $currentCheckout.Ref
+        } else {
+            $effectiveMcpDescription = $mcpTarget.Name
+            $effectiveMcpRef = $mcpTarget.Ref
+        }
+
+        $requiredGhidraVersion = Get-XmlElementValue `
+            -XmlPath (Join-Path $McpPath "pom.xml") `
+            -LocalName "ghidra.version"
+
+        $mcpProjectVersion = Get-XmlElementValue `
+            -XmlPath (Join-Path $McpPath "pom.xml") `
+            -LocalName "version"
+        $reuseInstalledDeployment = $false
     }
-
-    $requiredGhidraVersion = Get-XmlElementValue `
-        -XmlPath (Join-Path $McpPath "pom.xml") `
-        -LocalName "ghidra.version"
-
-    $mcpProjectVersion = Get-XmlElementValue `
-        -XmlPath (Join-Path $McpPath "pom.xml") `
-        -LocalName "version"
 
     if ([string]::IsNullOrWhiteSpace($requiredGhidraVersion)) {
         throw "Could not read <ghidra.version> from $McpPath\pom.xml."
@@ -1633,10 +1698,18 @@ try {
     }
 
     # STEP 9 - Download/reuse EXACT Ghidra version required by pom.xml.
-    $ghidraReleaseInfo = Get-GhidraReleaseForVersion -RequiredVersion $requiredGhidraVersion
-    $ghidraPath = Ensure-GhidraInstalled `
-        -RequiredVersion $requiredGhidraVersion `
-        -ReleaseInfo $ghidraReleaseInfo
+    if ($reuseInstalledDeployment) {
+        $ghidraPath = $installedDeployment.GhidraPath
+        $ghidraReleaseInfo = [pscustomobject]@{
+            Asset = [pscustomobject]@{ name = "existing ghidra_$($requiredGhidraVersion)_PUBLIC installation" }
+        }
+        Write-Ok "Using the already-installed Ghidra $requiredGhidraVersion at $ghidraPath."
+    } else {
+        $ghidraReleaseInfo = Get-GhidraReleaseForVersion -RequiredVersion $requiredGhidraVersion
+        $ghidraPath = Ensure-GhidraInstalled `
+            -RequiredVersion $requiredGhidraVersion `
+            -ReleaseInfo $ghidraReleaseInfo
+    }
 
     $existingDeploymentComplete = Test-ExistingMcpDeployment `
         -GhidraPath $ghidraPath `

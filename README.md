@@ -20,7 +20,7 @@ The UI lets you select:
 
 | MCP project | What it installs | Supported client platforms |
 | --- | --- | --- |
-| Ghidra MCP | Official Ghidra version matched to `bethington/ghidra-mcp`, its extension, and the local stdio bridge | Codex, Antigravity CLI, and/or Claude Code |
+| Ghidra MCP | `CitroenGames/ghidra-mcp`, its matching official Ghidra version, extension, and local stdio bridge | Codex, Antigravity CLI, and/or Claude Code |
 | Visual Studio IDE Bridge | The current `Visual-Studio-MCP` release, Visual Studio extension, and Windows bridge service | Codex, Antigravity CLI, and/or Claude Code |
 
 Each selected installer opens in a separate PowerShell window. Leave those windows open until they report their final verification result. The installers request UAC only when their underlying dependency requires it.
