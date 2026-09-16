@@ -645,9 +645,20 @@ function Invoke-ClaudeCapture {
         throw "The 'claude' command was found, but its executable/script path could not be resolved."
     }
 
-    $output = & $claudePath @Arguments 2>&1 | Out-String
+    # Windows PowerShell turns a native command's redirected stderr into a terminating
+    # NativeCommandError while $ErrorActionPreference is 'Stop'. 'claude mcp get' writes to
+    # stderr and exits non-zero whenever the server is not registered yet, which is the normal
+    # first-run state, so the probe has to stay non-terminating and be judged by its exit code.
+    # The assignment is function scoped; the script-wide 'Stop' preference is unaffected.
+    $ErrorActionPreference = 'Continue'
+
+    $output = & $claudePath @Arguments 2>&1 |
+        ForEach-Object { if ($_ -is [Management.Automation.ErrorRecord]) { $_.ToString() } else { $_ } } |
+        Out-String
+    $exitCode = $LASTEXITCODE
+
     return [pscustomobject]@{
-        ExitCode = $LASTEXITCODE
+        ExitCode = $exitCode
         Output = $output
         Command = $claudePath
     }
@@ -661,11 +672,13 @@ function Set-ClaudeCodeBridgeConfiguration {
         throw "Claude Code is not available in PATH. Install it first, then rerun with -Client ClaudeCode. See https://docs.anthropic.com/en/docs/claude-code/getting-started"
     }
 
+    # An existing registration can live in any scope, so a user-scope removal is allowed to
+    # fail: the add below rewrites the user-scope entry and the readback proves the final state.
     $existing = Invoke-ClaudeCapture -Arguments @('mcp', 'get', 'vs-ide-bridge')
     if ($existing.ExitCode -eq 0) {
         $remove = Invoke-ClaudeCapture -Arguments @('mcp', 'remove', 'vs-ide-bridge', '--scope', 'user')
         if ($remove.ExitCode -ne 0) {
-            throw "Could not remove the existing Claude Code MCP registration 'vs-ide-bridge'. Output: $($remove.Output)"
+            Write-Warning "Could not remove the existing 'vs-ide-bridge' registration at user scope; it may belong to a project or local scope. Output: $($remove.Output.Trim())"
         }
     }
 
@@ -680,6 +693,9 @@ function Set-ClaudeCodeBridgeConfiguration {
     $readback = Invoke-ClaudeCapture -Arguments @('mcp', 'get', 'vs-ide-bridge')
     if ($readback.ExitCode -ne 0) {
         throw "Claude Code MCP registration was added, but could not be read back. Output: $($readback.Output)"
+    }
+    if ($readback.Output -notmatch [regex]::Escape($ServiceExecutable)) {
+        throw "Claude Code resolves 'vs-ide-bridge' to a different command than the one just installed; a project or local scope entry is probably shadowing it. Output: $($readback.Output)"
     }
 
     Write-Host $readback.Output.TrimEnd()
