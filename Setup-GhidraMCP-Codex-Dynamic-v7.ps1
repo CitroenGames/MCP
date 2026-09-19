@@ -39,6 +39,7 @@ param(
     [string]$ToolsRoot = "C:\Tools",
     [switch]$UseMcpDefaultBranch,
     [switch]$ForceUpdate,
+    [switch]$ForceClientRegistration,
     [string[]]$Client = @('Codex')
 )
 
@@ -1025,7 +1026,161 @@ function Test-CodexMcpRegistration {
     throw "Could not determine whether Codex MCP server '$Name' exists. Exit code $($result.ExitCode). Output: $combined"
 }
 
+function Test-GhidraBridgeArgsCorrect {
+    param([object]$ArgsValue)
+
+    $argsArray = @($ArgsValue)
+    if ($argsArray.Count -ne 4) { return $false }
+    return ($argsArray[0] -eq 'run' -and
+        $argsArray[1] -eq '--directory' -and
+        ([string]$argsArray[2]).TrimEnd('\', '/') -ieq $McpPath.TrimEnd('\', '/') -and
+        $argsArray[3] -eq 'bridge-mcp-ghidra')
+}
+
+function Test-GhidraBridgeCommandArrayCorrect {
+    param([object]$CommandValue)
+
+    $commandArray = @($CommandValue)
+    if ($commandArray.Count -ne 5) { return $false }
+    return ($commandArray[0] -eq 'uv' -and
+        $commandArray[1] -eq 'run' -and
+        $commandArray[2] -eq '--directory' -and
+        ([string]$commandArray[3]).TrimEnd('\', '/') -ieq $McpPath.TrimEnd('\', '/') -and
+        $commandArray[4] -eq 'bridge-mcp-ghidra')
+}
+
+function Test-CodexGhidraBridgeCorrect {
+    # True only when Codex already points 'ghidra' at THIS install's bridge.
+    # Any probe failure returns $false so the caller re-registers instead of
+    # mistaking "could not check" for "already installed".
+    try {
+        $result = Invoke-CodexCapture -Arguments @("mcp", "get", "ghidra", "--json")
+        if ($result.ExitCode -ne 0) { return $false }
+        $raw = [string]$result.StdOut
+        if ([string]::IsNullOrWhiteSpace($raw)) { return $false }
+        if ($raw -notmatch 'bridge-mcp-ghidra') { return $false }
+        # CLI JSON output escapes backslashes (C:\\Tools\\...) so collapse
+        # doubled separators before comparing with the install path.
+        $normalizedRaw = ($raw -replace '\\\\', '\') -replace '/', '\'
+        $normalizedMcp = $McpPath -replace '/', '\'
+        if ($normalizedRaw -notlike "*$normalizedMcp*") { return $false }
+        try {
+            $parsed = $raw | ConvertFrom-Json
+            $candidates = @()
+            if ($parsed -is [Array]) { $candidates = $parsed }
+            elseif ($null -ne $parsed) {
+                $candidates = @($parsed)
+                foreach ($propName in @('config', 'server', 'definition')) {
+                    $prop = $parsed.PSObject.Properties[$propName]
+                    if ($null -ne $prop -and $null -ne $prop.Value) { $candidates += $prop.Value }
+                }
+            }
+            $structuralMatchFound = $false
+            $structuralChecked = $false
+            foreach ($candidate in $candidates) {
+                if ($null -eq $candidate) { continue }
+                $commandProp = $candidate.PSObject.Properties['command']
+                $argsProp = $candidate.PSObject.Properties['args']
+                if ($null -ne $commandProp -and $commandProp.Value -is [Array]) {
+                    $structuralChecked = $true
+                    if (Test-GhidraBridgeCommandArrayCorrect -CommandValue $commandProp.Value) {
+                        $structuralMatchFound = $true
+                    }
+                }
+                elseif ($null -ne $commandProp -and ([string]$commandProp.Value -ieq 'uv') -and $null -ne $argsProp) {
+                    $structuralChecked = $true
+                    if (Test-GhidraBridgeArgsCorrect -ArgsValue $argsProp.Value) {
+                        $structuralMatchFound = $true
+                    }
+                }
+            }
+            # The substring gate above already proved the bridge name and this
+            # install path are present; accept that when the CLI uses a schema
+            # this parser does not recognize, but reject a structurally parsed
+            # entry that clearly points elsewhere.
+            if ($structuralChecked -and -not $structuralMatchFound) { return $false }
+            return $true
+        } catch {
+            return $true
+        }
+    } catch {
+        return $false
+    }
+}
+
+function Test-ClaudeGhidraBridgeCorrect {
+    try {
+        $existing = Invoke-ClaudeCapture -Arguments @('mcp', 'get', 'ghidra')
+        if ($existing.ExitCode -ne 0) { return $false }
+        $raw = [string]$existing.StdOut
+        if ($raw -notmatch 'bridge-mcp-ghidra') { return $false }
+        $normalizedRaw = ($raw -replace '\\\\', '\') -replace '/', '\'
+        $normalizedMcp = $McpPath -replace '/', '\'
+        return ($normalizedRaw -like "*$normalizedMcp*")
+    } catch {
+        return $false
+    }
+}
+
+function Test-AntigravityGhidraBridgeCorrect {
+    $configPath = Join-Path $env:USERPROFILE '.gemini\config\mcp_config.json'
+    if (-not (Test-Path -LiteralPath $configPath)) { return $false }
+    try {
+        $raw = [IO.File]::ReadAllText($configPath)
+        if ([string]::IsNullOrWhiteSpace($raw)) { return $false }
+        $root = $raw | ConvertFrom-Json
+        $serversProp = $root.PSObject.Properties['mcpServers']
+        if ($null -eq $serversProp -or $null -eq $serversProp.Value) { return $false }
+        $entry = $serversProp.Value.PSObject.Properties['ghidra']
+        if ($null -eq $entry -or $null -eq $entry.Value) { return $false }
+        if ([string]$entry.Value.command -ine 'uv') { return $false }
+        return (Test-GhidraBridgeArgsCorrect -ArgsValue $entry.Value.args)
+    } catch {
+        return $false
+    }
+}
+
+function Test-OpenCodeGhidraBridgeCorrect {
+    $configPath = Get-OpenCodeConfigPath
+    if (-not (Test-Path -LiteralPath $configPath)) { return $false }
+    try {
+        $root = ConvertFrom-OpenCodeJson -RawContent ([IO.File]::ReadAllText($configPath))
+        $mcpProp = $root.PSObject.Properties['mcp']
+        if ($null -eq $mcpProp -or $null -eq $mcpProp.Value) { return $false }
+        $flatEntry = $mcpProp.Value.PSObject.Properties['ghidra']
+        if ($null -ne $flatEntry -and $null -ne $flatEntry.Value) {
+            $commandProp = $flatEntry.Value.PSObject.Properties['command']
+            if ($null -ne $commandProp -and (Test-GhidraBridgeCommandArrayCorrect -CommandValue $commandProp.Value)) {
+                return $true
+            }
+        }
+        $serversProp = $mcpProp.Value.PSObject.Properties['servers']
+        if ($null -ne $serversProp -and $null -ne $serversProp.Value) {
+            $nestedEntry = $serversProp.Value.PSObject.Properties['ghidra']
+            if ($null -ne $nestedEntry -and $null -ne $nestedEntry.Value) {
+                $nestedCommand = $nestedEntry.Value.PSObject.Properties['command']
+                if ($null -ne $nestedCommand -and (Test-GhidraBridgeCommandArrayCorrect -CommandValue $nestedCommand.Value)) {
+                    return $true
+                }
+            }
+        }
+        return $false
+    } catch {
+        return $false
+    }
+}
+
 function Ensure-CodexMcpRegistration {
+    Write-Step "Checking Codex MCP registration for 'ghidra'"
+
+    if ((-not $ForceClientRegistration) -and (Test-CodexGhidraBridgeCorrect)) {
+        Write-Ok "Codex already registers 'ghidra' with this bridge ($McpPath); skipping re-registration."
+        $verifyResult = Invoke-CodexCapture -Arguments @("mcp", "get", "ghidra", "--json")
+        if ($verifyResult.StdOut) { Write-Host $verifyResult.StdOut.TrimEnd() }
+        Write-Ok "Codex MCP registration verified (already installed)."
+        return 'already-installed'
+    }
+
     Write-Step "Registering ghidra MCP bridge with Codex"
 
     $exists = Test-CodexMcpRegistration -Name "ghidra"
@@ -1075,10 +1230,21 @@ function Ensure-CodexMcpRegistration {
         throw "Codex MCP registration was added, but could not be read back."
     }
 
-    Write-Ok "Codex MCP registration verified."
+    Write-Ok "Codex MCP registration verified (newly registered)."
+    return 'registered'
 }
 
 function Ensure-ClaudeCodeMcpRegistration {
+    Write-Step "Checking Claude Code MCP registration for 'ghidra'"
+
+    if ((-not $ForceClientRegistration) -and (Test-ClaudeGhidraBridgeCorrect)) {
+        Write-Ok "Claude Code already registers 'ghidra' with this bridge ($McpPath); skipping re-registration."
+        $readback = Invoke-ClaudeCapture -Arguments @('mcp', 'get', 'ghidra')
+        if ($readback.StdOut) { Write-Host $readback.StdOut.TrimEnd() }
+        Write-Ok 'Claude Code MCP registration verified at user scope (already installed).'
+        return 'already-installed'
+    }
+
     Write-Step "Registering ghidra MCP bridge with Claude Code"
 
     $existing = Invoke-ClaudeCapture -Arguments @('mcp', 'get', 'ghidra')
@@ -1102,10 +1268,18 @@ function Ensure-ClaudeCodeMcpRegistration {
         throw "Claude Code MCP registration was added, but could not be read back. Output: $($readback.StdOut)`n$($readback.StdErr)"
     }
     if ($readback.StdOut) { Write-Host $readback.StdOut.TrimEnd() }
-    Write-Ok 'Claude Code MCP registration verified at user scope.'
+    Write-Ok 'Claude Code MCP registration verified at user scope (newly registered).'
+    return 'registered'
 }
 
 function Set-AntigravityGhidraConfiguration {
+    Write-Step "Checking Antigravity CLI MCP registration for 'ghidra'"
+
+    if ((-not $ForceClientRegistration) -and (Test-AntigravityGhidraBridgeCorrect)) {
+        Write-Ok "Antigravity already registers 'ghidra' with this bridge ($McpPath); skipping re-registration."
+        return 'already-installed'
+    }
+
     Write-Step 'Registering ghidra MCP bridge with Antigravity CLI'
 
     $configDirectory = Join-Path $env:USERPROFILE '.gemini\config'
@@ -1162,7 +1336,8 @@ function Set-AntigravityGhidraConfiguration {
     if ($null -eq $entry -or $entry.Value.command -ne 'uv' -or @($entry.Value.args).Count -ne 4) {
         throw 'Antigravity configuration readback did not contain the expected ghidra entry.'
     }
-    Write-Ok "Antigravity MCP registration verified: $configPath"
+    Write-Ok "Antigravity MCP registration verified: $configPath (newly registered)."
+    return 'registered'
 }
 
 
@@ -1196,6 +1371,13 @@ function ConvertFrom-OpenCodeJson {
 }
 
 function Set-OpenCodeGhidraConfiguration {
+    Write-Step "Checking OpenCode MCP registration for 'ghidra'"
+
+    if ((-not $ForceClientRegistration) -and (Test-OpenCodeGhidraBridgeCorrect)) {
+        Write-Ok "OpenCode already registers 'ghidra' with this bridge ($McpPath); skipping re-registration."
+        return 'already-installed'
+    }
+
     Write-Step 'Registering ghidra MCP bridge with OpenCode'
 
     $configPath = Get-OpenCodeConfigPath
@@ -1312,7 +1494,8 @@ function Set-OpenCodeGhidraConfiguration {
     else {
         Write-Host 'OpenCode CLI was not found in PATH; configuration was verified by reading the JSON file back.'
     }
-    Write-Ok "OpenCode MCP registration verified: $configPath"
+    Write-Ok "OpenCode MCP registration verified: $configPath (newly registered)."
+    return 'registered'
 }
 
 
@@ -1608,6 +1791,9 @@ if (-not $isAdmin) {
     }
     if ($ForceUpdate) {
         $relaunchArgs += "-ForceUpdate"
+    }
+    if ($ForceClientRegistration) {
+        $relaunchArgs += "-ForceClientRegistration"
     }
     $relaunchArgs += "-Client", ('"{0}"' -f ($Client -join ','))
 
@@ -1922,17 +2108,41 @@ try {
     }
 
     # STEP 11 - Register the selected MCP clients.
+    # Only selected clients are touched. A client whose 'ghidra' entry already
+    # points at this install's bridge is verified and skipped unless
+    # -ForceClientRegistration was passed for an explicit reinstall.
+    $clientRegistrationSummary = New-Object System.Collections.Generic.List[string]
     if (Test-SelectedClient -Name 'Codex') {
-        Ensure-CodexMcpRegistration
+        $codexRegistration = Ensure-CodexMcpRegistration
+        if ($codexRegistration -eq 'already-installed') {
+            $clientRegistrationSummary.Add('Codex: already installed (verified, skipped)')
+        } else {
+            $clientRegistrationSummary.Add('Codex: newly registered')
+        }
     }
     if (Test-SelectedClient -Name 'Antigravity') {
-        Set-AntigravityGhidraConfiguration
+        $antigravityRegistration = Set-AntigravityGhidraConfiguration
+        if ($antigravityRegistration -eq 'already-installed') {
+            $clientRegistrationSummary.Add('Antigravity CLI: already installed (verified, skipped)')
+        } else {
+            $clientRegistrationSummary.Add('Antigravity CLI: newly registered')
+        }
     }
     if (Test-SelectedClient -Name 'ClaudeCode') {
-        Ensure-ClaudeCodeMcpRegistration
+        $claudeRegistration = Ensure-ClaudeCodeMcpRegistration
+        if ($claudeRegistration -eq 'already-installed') {
+            $clientRegistrationSummary.Add('Claude Code: already installed (verified, skipped)')
+        } else {
+            $clientRegistrationSummary.Add('Claude Code: newly registered')
+        }
     }
     if (Test-SelectedClient -Name 'OpenCode') {
-        Set-OpenCodeGhidraConfiguration
+        $openCodeRegistration = Set-OpenCodeGhidraConfiguration
+        if ($openCodeRegistration -eq 'already-installed') {
+            $clientRegistrationSummary.Add('OpenCode: already installed (verified, skipped)')
+        } else {
+            $clientRegistrationSummary.Add('OpenCode: newly registered')
+        }
     }
 
     # STEP 12 - Final verification of paths/files before calling setup complete.
@@ -1967,6 +2177,9 @@ try {
     Write-Host "Ghidra:       $requiredGhidraVersion"
     Write-Host "Ghidra path:  $ghidraPath"
     Write-Host "MCP path:     $McpPath"
+    foreach ($registrationLine in $clientRegistrationSummary) {
+        Write-Host "Client:       $registrationLine"
+    }
     try {
         $codexResolved = Get-Command codex -ErrorAction Stop | Select-Object -First 1
         Write-Host "Codex cmd:    $($codexResolved.Source)"

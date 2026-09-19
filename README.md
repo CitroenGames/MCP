@@ -38,6 +38,17 @@ Codex registrations use its CLI and are read back after setup. Antigravity regis
 
 The Ghidra installer uses `C:\Tools` by default. The Visual Studio bridge uses `C:\tools` by default. Both installers accept a `-ToolsRoot` argument when run directly.
 
+## Already-installed detection
+
+Detection is per client, not per machine. If Ghidra MCP is already installed for Codex but not for Claude Code, run the installer with only Claude Code checked (or `-Client ClaudeCode`): the Codex registration is left untouched, and only Claude Code is added.
+
+Before rewriting a registration, each installer checks whether that client's entry already points at the bridge being installed:
+
+- Codex / Claude Code: probed through `codex mcp get` / `claude mcp get` and compared against the current install path.
+- Antigravity / OpenCode: the JSON config entry is compared against the current install path.
+
+An entry that already matches is verified and skipped (`already installed`), anything missing or pointing elsewhere is (re)registered, and the final summary reports `already installed` vs `newly registered` per client. Only checked/selected clients are ever touched. To force a rewrite of entries that already look correct, pass `-ForceClientRegistration` (Hub: tick "Force reinstall client registrations") or click "Refresh status" in the Hub to see the per-client state before installing.
+
 ## Run one project without the UI
 
 ```powershell

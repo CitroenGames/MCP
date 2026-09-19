@@ -23,6 +23,7 @@ param(
     [string]$CodexHome = '',
     [string[]]$Client = @('Codex'),
     [switch]$SkipSourceClone,
+    [switch]$ForceClientRegistration,
     [switch]$Help
 )
 
@@ -72,6 +73,7 @@ Usage:
   .\Setup-Visual-Studio-MCP.ps1 -Client OpenCode
   .\Setup-Visual-Studio-MCP.ps1 -Client All
   .\Setup-Visual-Studio-MCP.ps1 -SkipSourceClone
+  .\Setup-Visual-Studio-MCP.ps1 -ForceClientRegistration
   .\Setup-Visual-Studio-MCP.ps1 -ToolsRoot D:\tools
 
 Defaults:
@@ -99,7 +101,8 @@ function Invoke-SelfElevated {
         [string]$ResolvedToolsRoot,
         [string]$ResolvedCodexHome,
         [string[]]$SelectedClient,
-        [bool]$ShouldSkipSourceClone
+        [bool]$ShouldSkipSourceClone,
+        [bool]$ShouldForceClientRegistration
     )
 
     Write-Step 'Requesting administrator access'
@@ -119,6 +122,7 @@ function Invoke-SelfElevated {
         CodexHome = $ResolvedCodexHome
         Client = $SelectedClient
         SkipSourceClone = $ShouldSkipSourceClone
+        ForceClientRegistration = $ShouldForceClientRegistration
         OutputPath = $standardOutputPath
         ChildStandardOutputPath = $childStandardOutputPath
         ChildStandardErrorPath = $childStandardErrorPath
@@ -135,6 +139,7 @@ $innerTemplate = @(
     '$data = $json | ConvertFrom-Json',
     '$childParameters = @{ ToolsRoot = [string]$data.ToolsRoot; CodexHome = [string]$data.CodexHome; Client = @($data.Client | ForEach-Object { [string]$_ }) }',
     'if ([bool]$data.SkipSourceClone) { $childParameters.SkipSourceClone = $true }',
+    'if ([bool]$data.ForceClientRegistration) { $childParameters.ForceClientRegistration = $true }',
     '& ([string]$data.ScriptPath) @childParameters'
 ) -join [Environment]::NewLine
 $innerCommand = $innerTemplate.Replace('__INNER_PAYLOAD__', '__PAYLOAD__')
@@ -469,8 +474,136 @@ function Install-Bridge {
     return $serviceExecutable
 }
 
+function Get-ExpectedVsBridgeExecutable {
+    param([string]$ServiceExecutable)
+
+    if (-not [string]::IsNullOrWhiteSpace($ServiceExecutable)) {
+        return $ServiceExecutable
+    }
+    return (Join-Path $script:InstallRoot 'service\VsIdeBridgeService.exe')
+}
+
+function Test-VsBridgeArgsCorrect {
+    param([object]$ArgsValue)
+
+    $argsArray = @($ArgsValue)
+    return ($argsArray.Count -eq 1 -and $argsArray[0] -eq 'mcp-server')
+}
+
+function Test-CodexVsBridgeCorrect {
+    param([string]$ServiceExecutable)
+
+    $expected = Get-ExpectedVsBridgeExecutable -ServiceExecutable $ServiceExecutable
+    $configPath = Join-Path $script:CodexHome 'config.toml'
+    if (-not (Test-Path -LiteralPath $configPath)) { return $false }
+    try {
+        $raw = [IO.File]::ReadAllText($configPath)
+        if ([string]::IsNullOrWhiteSpace($raw)) { return $false }
+        # Isolate the [mcp_servers.vs-ide-bridge] table so a different server
+        # entry cannot produce a false "already installed" match.
+        $lines = @([regex]::Split($raw, '\r?\n'))
+        $inTargetTable = $false
+        $tableFound = $false
+        $tableText = ''
+        foreach ($line in $lines) {
+            if ($line -match '^\s*\[mcp_servers\.(?:vs-ide-bridge|"vs-ide-bridge"|''vs-ide-bridge'')\]\s*$') {
+                $inTargetTable = $true
+                $tableFound = $true
+                continue
+            }
+            if ($inTargetTable -and $line -match '^\s*\[') {
+                $inTargetTable = $false
+            }
+            if ($inTargetTable) { $tableText += "`n" + $line }
+        }
+        if (-not $tableFound) { return $false }
+        $normalizedTable = $tableText -replace '\\\\', '\'
+        if ($normalizedTable -notlike "*$expected*") { return $false }
+        return ($normalizedTable -match 'mcp-server')
+    } catch {
+        return $false
+    }
+}
+
+function Test-AntigravityVsBridgeCorrect {
+    param([string]$ServiceExecutable)
+
+    $expected = Get-ExpectedVsBridgeExecutable -ServiceExecutable $ServiceExecutable
+    $configPath = Join-Path $env:USERPROFILE '.gemini\config\mcp_config.json'
+    if (-not (Test-Path -LiteralPath $configPath)) { return $false }
+    try {
+        $root = ([IO.File]::ReadAllText($configPath) | ConvertFrom-Json)
+        $serversProp = $root.PSObject.Properties['mcpServers']
+        if ($null -eq $serversProp -or $null -eq $serversProp.Value) { return $false }
+        $entry = $serversProp.Value.PSObject.Properties['vs-ide-bridge']
+        if ($null -eq $entry -or $null -eq $entry.Value) { return $false }
+        if ([string]$entry.Value.command -ine $expected) { return $false }
+        return (Test-VsBridgeArgsCorrect -ArgsValue $entry.Value.args)
+    } catch {
+        return $false
+    }
+}
+
+function Test-ClaudeVsBridgeCorrect {
+    param([string]$ServiceExecutable)
+
+    $expected = Get-ExpectedVsBridgeExecutable -ServiceExecutable $ServiceExecutable
+    if ($null -eq (Get-Command claude -ErrorAction SilentlyContinue)) { return $false }
+    try {
+        $existing = Invoke-ClaudeCapture -Arguments @('mcp', 'get', 'vs-ide-bridge')
+        if ($existing.ExitCode -ne 0) { return $false }
+        $raw = [string]$existing.Output
+        if ([string]::IsNullOrWhiteSpace($raw)) { return $false }
+        $normalizedRaw = ($raw -replace '\\\\', '\') -replace '/', '\'
+        $normalizedExpected = $expected -replace '/', '\'
+        if ($normalizedRaw -notlike "*$normalizedExpected*") { return $false }
+        return ($raw -match 'mcp-server')
+    } catch {
+        return $false
+    }
+}
+
+function Test-OpenCodeVsBridgeCorrect {
+    param([string]$ServiceExecutable)
+
+    $expected = Get-ExpectedVsBridgeExecutable -ServiceExecutable $ServiceExecutable
+    $configPath = Get-OpenCodeConfigPath
+    if (-not (Test-Path -LiteralPath $configPath)) { return $false }
+    try {
+        $root = ConvertFrom-OpenCodeJson -RawContent ([IO.File]::ReadAllText($configPath))
+        $mcpProp = $root.PSObject.Properties['mcp']
+        if ($null -eq $mcpProp -or $null -eq $mcpProp.Value) { return $false }
+        $candidates = @()
+        $flatEntry = $mcpProp.Value.PSObject.Properties['vs-ide-bridge']
+        if ($null -ne $flatEntry -and $null -ne $flatEntry.Value) { $candidates += $flatEntry.Value }
+        $serversProp = $mcpProp.Value.PSObject.Properties['servers']
+        if ($null -ne $serversProp -and $null -ne $serversProp.Value) {
+            $nestedEntry = $serversProp.Value.PSObject.Properties['vs-ide-bridge']
+            if ($null -ne $nestedEntry -and $null -ne $nestedEntry.Value) { $candidates += $nestedEntry.Value }
+        }
+        foreach ($candidate in $candidates) {
+            $commandProp = $candidate.PSObject.Properties['command']
+            if ($null -eq $commandProp) { continue }
+            $commandArray = @($commandProp.Value)
+            if ($commandArray.Count -eq 2 -and $commandArray[0] -ieq $expected -and $commandArray[1] -eq 'mcp-server') {
+                return $true
+            }
+        }
+        return $false
+    } catch {
+        return $false
+    }
+}
+
 function Set-CodexBridgeConfiguration {
     param([string]$ServiceExecutable)
+
+    Write-Step "Checking Codex 'vs-ide-bridge' registration"
+    if ((-not $ForceClientRegistration) -and (Test-CodexVsBridgeCorrect -ServiceExecutable $ServiceExecutable)) {
+        $existingConfigPath = Join-Path $script:CodexHome 'config.toml'
+        Write-Host "Codex already registers 'vs-ide-bridge' with this bridge ($ServiceExecutable); skipping re-registration."
+        return "$existingConfigPath (already installed)"
+    }
 
     Write-Step 'Configuring Codex STDIO transport'
     New-Item -ItemType Directory -Path $CodexHome -Force | Out-Null
@@ -556,11 +689,21 @@ function Set-CodexBridgeConfiguration {
     }
 
     Write-Host "Codex config: $configPath"
+    if (Test-CodexVsBridgeCorrect -ServiceExecutable $ServiceExecutable) {
+        return "$configPath (newly registered)"
+    }
     return $configPath
 }
 
 function Set-AntigravityBridgeConfiguration {
     param([string]$ServiceExecutable)
+
+    $configPath = Join-Path $env:USERPROFILE '.gemini\config\mcp_config.json'
+    Write-Step "Checking Antigravity CLI 'vs-ide-bridge' registration"
+    if ((-not $ForceClientRegistration) -and (Test-AntigravityVsBridgeCorrect -ServiceExecutable $ServiceExecutable)) {
+        Write-Host "Antigravity already registers 'vs-ide-bridge' with this bridge ($ServiceExecutable); skipping re-registration."
+        return "$configPath (already installed)"
+    }
 
     Write-Step 'Configuring Antigravity CLI STDIO transport'
     $antigravityConfigDirectory = Join-Path $env:USERPROFILE '.gemini\config'
@@ -636,6 +779,9 @@ function Set-AntigravityBridgeConfiguration {
     }
 
     Write-Host "Antigravity config: $configPath"
+    if (Test-AntigravityVsBridgeCorrect -ServiceExecutable $ServiceExecutable) {
+        return "$configPath (newly registered)"
+    }
     return $configPath
 }
 
@@ -670,6 +816,12 @@ function Invoke-ClaudeCapture {
 function Set-ClaudeCodeBridgeConfiguration {
     param([string]$ServiceExecutable)
 
+    Write-Step "Checking Claude Code 'vs-ide-bridge' registration"
+    if ((-not $ForceClientRegistration) -and (Test-ClaudeVsBridgeCorrect -ServiceExecutable $ServiceExecutable)) {
+        Write-Host "Claude Code already registers 'vs-ide-bridge' with this bridge ($ServiceExecutable); skipping re-registration."
+        return 'Claude Code user MCP configuration (already installed)'
+    }
+
     Write-Step 'Configuring Claude Code STDIO transport'
     if ($null -eq (Get-Command claude -ErrorAction SilentlyContinue)) {
         throw "Claude Code is not available in PATH. Install it first, then rerun with -Client ClaudeCode. See https://docs.anthropic.com/en/docs/claude-code/getting-started"
@@ -703,7 +855,7 @@ function Set-ClaudeCodeBridgeConfiguration {
 
     Write-Host $readback.Output.TrimEnd()
     Write-Host 'Claude Code MCP registration verified at user scope.'
-    return 'Claude Code user MCP configuration'
+    return 'Claude Code user MCP configuration (newly registered)'
 }
 
 function Get-OpenCodeConfigPath {
@@ -737,6 +889,13 @@ function ConvertFrom-OpenCodeJson {
 
 function Set-OpenCodeBridgeConfiguration {
     param([string]$ServiceExecutable)
+
+    Write-Step "Checking OpenCode 'vs-ide-bridge' registration"
+    if ((-not $ForceClientRegistration) -and (Test-OpenCodeVsBridgeCorrect -ServiceExecutable $ServiceExecutable)) {
+        $existingConfigPath = Get-OpenCodeConfigPath
+        Write-Host "OpenCode already registers 'vs-ide-bridge' with this bridge ($ServiceExecutable); skipping re-registration."
+        return "$existingConfigPath (already installed)"
+    }
 
     Write-Step 'Configuring OpenCode STDIO transport'
     $configPath = Get-OpenCodeConfigPath
@@ -870,6 +1029,9 @@ function Set-OpenCodeBridgeConfiguration {
     }
 
     Write-Host "OpenCode config: $configPath"
+    if (Test-OpenCodeVsBridgeCorrect -ServiceExecutable $ServiceExecutable) {
+        return "$configPath (newly registered)"
+    }
     return $configPath
 }
 
@@ -970,7 +1132,8 @@ function Main {
     if (-not (Test-Administrator)) {
         Invoke-SelfElevated -ScriptPath $PSCommandPath -ResolvedToolsRoot $ToolsRoot `
             -ResolvedCodexHome $CodexHome -SelectedClient $Client `
-            -ShouldSkipSourceClone ([bool]$SkipSourceClone)
+            -ShouldSkipSourceClone ([bool]$SkipSourceClone) `
+            -ShouldForceClientRegistration ([bool]$ForceClientRegistration)
     }
 
     New-Item -ItemType Directory -Path $ToolsRoot -Force | Out-Null
@@ -985,6 +1148,7 @@ function Main {
     Assert-SupportedVisualStudio
     Install-SourceSnapshot -Release $release
     $serviceExecutable = Install-Bridge -InstallerPath $installerPath -ReleaseTag $release.Tag
+    Write-Host 'Only the selected clients will be touched; entries already pointing at this bridge are verified and skipped unless -ForceClientRegistration is passed.'
     $configuredClients = New-Object System.Collections.Generic.List[string]
     if (Test-SelectedClient -Name 'Codex') {
         $configPath = Set-CodexBridgeConfiguration -ServiceExecutable $serviceExecutable
