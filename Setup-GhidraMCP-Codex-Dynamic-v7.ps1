@@ -67,15 +67,15 @@ function Test-SelectedClient {
 }
 
 function Assert-SelectedClients {
-    $validClients = @('Codex', 'Antigravity', 'ClaudeCode', 'Both', 'All')
+    $validClients = @('Codex', 'Antigravity', 'ClaudeCode', 'OpenCode', 'Both', 'All')
     $requestedClients = @($Client | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
     if ($requestedClients.Count -eq 0) {
-        throw 'Choose at least one client: Codex, Antigravity, or ClaudeCode.'
+        throw 'Choose at least one client: Codex, Antigravity, ClaudeCode, or OpenCode.'
     }
     $invalidClients = @($requestedClients |
         Where-Object { $_ -and $_ -notin $validClients })
     if ($invalidClients.Count -gt 0) {
-        throw "Unknown client selection: $($invalidClients -join ', '). Choose Codex, Antigravity, ClaudeCode, or All."
+        throw "Unknown client selection: $($invalidClients -join ', '). Choose Codex, Antigravity, ClaudeCode, OpenCode, or All."
     }
 }
 
@@ -1166,6 +1166,156 @@ function Set-AntigravityGhidraConfiguration {
 }
 
 
+function Get-OpenCodeConfigPath {
+    if (-not [string]::IsNullOrWhiteSpace($env:OPENCODE_CONFIG)) {
+        $custom = $env:OPENCODE_CONFIG.Trim().Trim('"')
+        if (Test-Path -LiteralPath $custom -PathType Container) {
+            return (Join-Path $custom 'opencode.json')
+        }
+        if ($custom -match '\.jsonc?$') {
+            return $custom
+        }
+        return $custom
+    }
+    return (Join-Path $env:USERPROFILE '.config\opencode\opencode.json')
+}
+
+function ConvertFrom-OpenCodeJson {
+    param([Parameter(Mandatory)][string]$RawContent)
+
+    try {
+        return $RawContent | ConvertFrom-Json
+    }
+    catch {
+        # opencode.json supports JSONC (comments). Strip // line comments and
+        # /* */ block comments, then retry once before giving up.
+        $stripped = [regex]::Replace($RawContent, '(?m)(?<!https:)(?<!http:)//.*$', '')
+        $stripped = [regex]::Replace($stripped, '/\*.*?\*/', '', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+        return $stripped | ConvertFrom-Json
+    }
+}
+
+function Set-OpenCodeGhidraConfiguration {
+    Write-Step 'Registering ghidra MCP bridge with OpenCode'
+
+    $configPath = Get-OpenCodeConfigPath
+    $configDirectory = Split-Path -Parent $configPath
+    if ([string]::IsNullOrWhiteSpace($configDirectory)) {
+        throw "Could not resolve the OpenCode config directory from: $configPath"
+    }
+    New-Item -ItemType Directory -Path $configDirectory -Force | Out-Null
+
+    $root = $null
+    if (Test-Path -LiteralPath $configPath) {
+        $existing = [IO.File]::ReadAllText($configPath)
+        if (-not [string]::IsNullOrWhiteSpace($existing)) {
+            try { $root = ConvertFrom-OpenCodeJson -RawContent $existing }
+            catch { throw "OpenCode config is not valid JSON and was left unchanged: $configPath. $($_.Exception.Message)" }
+        }
+    }
+    if ($null -eq $root) { $root = New-Object PSObject }
+    if ($root -is [Array] -or $root -is [string] -or $root -is [ValueType]) {
+        throw "OpenCode config must contain a JSON object and was left unchanged: $configPath"
+    }
+
+    # OpenCode v1 uses a flat "mcp": { "<name>": {...} } object, while v2 nests
+    # servers under "mcp": { "servers": { "<name>": {...} } }. Write the entry
+    # to both locations so the bridge works regardless of the installed version.
+    $mcpProperty = $root.PSObject.Properties['mcp']
+    if ($null -eq $mcpProperty -or $null -eq $mcpProperty.Value) {
+        $mcpObject = New-Object PSObject
+        $root | Add-Member -MemberType NoteProperty -Name 'mcp' -Value $mcpObject -Force
+    }
+    else {
+        $mcpObject = $mcpProperty.Value
+        if ($mcpObject -is [Array] -or $mcpObject -is [string] -or $mcpObject -is [ValueType]) {
+            throw "OpenCode mcp section must be a JSON object and was left unchanged: $configPath"
+        }
+    }
+
+    $commandArray = @('uv', 'run', '--directory', $McpPath, 'bridge-mcp-ghidra')
+    $mcpObject | Add-Member -MemberType NoteProperty -Name 'ghidra' -Value ([pscustomobject][ordered]@{
+        type = 'local'
+        command = $commandArray
+        enabled = $true
+    }) -Force
+
+    $serversProperty = $mcpObject.PSObject.Properties['servers']
+    if ($null -eq $serversProperty -or $null -eq $serversProperty.Value) {
+        $serversObject = New-Object PSObject
+        $mcpObject | Add-Member -MemberType NoteProperty -Name 'servers' -Value $serversObject -Force
+    }
+    else {
+        $serversObject = $serversProperty.Value
+        if ($serversObject -is [Array] -or $serversObject -is [string] -or $serversObject -is [ValueType]) {
+            throw "OpenCode mcp.servers must be a JSON object and was left unchanged: $configPath"
+        }
+    }
+    $serversObject | Add-Member -MemberType NoteProperty -Name 'ghidra' -Value ([pscustomobject][ordered]@{
+        type = 'local'
+        command = @('uv', 'run', '--directory', $McpPath, 'bridge-mcp-ghidra')
+        enabled = $true
+    }) -Force
+
+    $updated = ($root | ConvertTo-Json -Depth 30) + "`r`n"
+    if (-not (Test-Path -LiteralPath $configPath) -or [IO.File]::ReadAllText($configPath) -ne $updated) {
+        if (Test-Path -LiteralPath $configPath) {
+            $backupPath = $configPath + '.backup-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
+            Copy-Item -LiteralPath $configPath -Destination $backupPath
+            Write-Host "Backed up the previous OpenCode config to $backupPath"
+        }
+        $temporaryPath = $configPath + '.new-' + [Guid]::NewGuid().ToString('N')
+        try {
+            [IO.File]::WriteAllText($temporaryPath, $updated, (New-Object Text.UTF8Encoding($false)))
+            Move-Item -LiteralPath $temporaryPath -Destination $configPath -Force
+        } finally {
+            if (Test-Path -LiteralPath $temporaryPath) { Remove-Item -LiteralPath $temporaryPath -Force }
+        }
+    }
+
+    $readback = ConvertFrom-OpenCodeJson -RawContent ([IO.File]::ReadAllText($configPath))
+    $flatEntry = $readback.mcp.PSObject.Properties['ghidra']
+    $nestedEntry = $null
+    $serversReadback = $readback.mcp.PSObject.Properties['servers']
+    if ($null -ne $serversReadback -and $null -ne $serversReadback.Value) {
+        $nestedEntry = $serversReadback.Value.PSObject.Properties['ghidra']
+    }
+    $validEntry = $false
+    foreach ($candidate in @($flatEntry, $nestedEntry)) {
+        if ($null -ne $candidate -and $candidate.Value.type -eq 'local' -and `
+            @($candidate.Value.command).Count -eq 5 -and `
+            $candidate.Value.command[0] -eq 'uv' -and `
+            $candidate.Value.command[4] -eq 'bridge-mcp-ghidra') {
+            $validEntry = $true
+        }
+    }
+    if (-not $validEntry) {
+        throw 'OpenCode configuration readback did not contain the expected ghidra entry.'
+    }
+
+    $opencodeCommand = Get-Command opencode -ErrorAction SilentlyContinue
+    if ($null -ne $opencodeCommand) {
+        $opencodePath = if ($opencodeCommand.Source) { $opencodeCommand.Source } else { $opencodeCommand.Path }
+        try {
+            $listOutput = & $opencodePath mcp list 2>&1 | Out-String
+            if ($LASTEXITCODE -eq 0 -and $listOutput -notmatch 'ghidra') {
+                Write-WarnMsg "OpenCode config was updated, but 'opencode mcp list' does not show 'ghidra' yet. Restart OpenCode and retry 'opencode mcp list'."
+            }
+            elseif ($LASTEXITCODE -eq 0) {
+                Write-Host "OpenCode CLI confirms 'ghidra' is listed."
+            }
+        }
+        catch {
+            Write-WarnMsg "OpenCode config was updated, but 'opencode mcp list' could not be verified: $($_.Exception.Message)"
+        }
+    }
+    else {
+        Write-Host 'OpenCode CLI was not found in PATH; configuration was verified by reading the JSON file back.'
+    }
+    Write-Ok "OpenCode MCP registration verified: $configPath"
+}
+
+
 function Write-DynamicInstructions {
     param(
         [Parameter(Mandatory)][string]$McpTargetDescription,
@@ -1334,6 +1484,8 @@ Then:
 $(if (Test-SelectedClient -Name 'Codex') { 'codex mcp get ghidra --json' })
 $(if ((Test-SelectedClient -Name 'Codex') -and (Test-SelectedClient -Name 'ClaudeCode')) { "`r`nOr, for Claude Code:" })
 $(if (Test-SelectedClient -Name 'ClaudeCode') { 'claude mcp get ghidra' })
+$(if (((Test-SelectedClient -Name 'Codex') -or (Test-SelectedClient -Name 'ClaudeCode')) -and (Test-SelectedClient -Name 'OpenCode')) { "`r`nOr, for OpenCode:" })
+$(if (Test-SelectedClient -Name 'OpenCode') { 'opencode mcp list' })
 
 The registered command should resolve to the ghidra-mcp checkout at:
 
@@ -1778,6 +1930,9 @@ try {
     }
     if (Test-SelectedClient -Name 'ClaudeCode') {
         Ensure-ClaudeCodeMcpRegistration
+    }
+    if (Test-SelectedClient -Name 'OpenCode') {
+        Set-OpenCodeGhidraConfiguration
     }
 
     # STEP 12 - Final verification of paths/files before calling setup complete.

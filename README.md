@@ -20,8 +20,8 @@ The UI lets you select:
 
 | MCP project | What it installs | Supported client platforms |
 | --- | --- | --- |
-| Ghidra MCP | `CitroenGames/ghidra-mcp`, its matching official Ghidra version, extension, and local stdio bridge | Codex, Antigravity CLI, and/or Claude Code |
-| Visual Studio IDE Bridge | The current `Visual-Studio-MCP` release, Visual Studio extension, and Windows bridge service | Codex, Antigravity CLI, and/or Claude Code |
+| Ghidra MCP | `CitroenGames/ghidra-mcp`, its matching official Ghidra version, extension, and local stdio bridge | Codex, Antigravity CLI, Claude Code, and/or OpenCode |
+| Visual Studio IDE Bridge | The current `Visual-Studio-MCP` release, Visual Studio extension, and Windows bridge service | Codex, Antigravity CLI, Claude Code, and/or OpenCode |
 
 Each selected installer opens in a separate PowerShell window. Leave those windows open until they report their final verification result. The installers request UAC only when their underlying dependency requires it.
 
@@ -34,7 +34,7 @@ Each selected installer opens in a separate PowerShell window. Leave those windo
 
 ## What the installers configure
 
-Codex registrations use its CLI and are read back after setup. Antigravity registrations are written into `%USERPROFILE%\.gemini\config\mcp_config.json`; an existing valid file is backed up before it changes. Claude Code registrations use `claude mcp` at user scope and are read back after setup.
+Codex registrations use its CLI and are read back after setup. Antigravity registrations are written into `%USERPROFILE%\.gemini\config\mcp_config.json`; an existing valid file is backed up before it changes. Claude Code registrations use `claude mcp` at user scope and are read back after setup. OpenCode registrations are written into `%USERPROFILE%\.config\opencode\opencode.json` (or `$env:OPENCODE_CONFIG` when set) as a local stdio entry under both `mcp.<name>` and `mcp.servers.<name>` for v1/v2 compatibility; an existing file is backed up before it changes and the result is read back after setup.
 
 The Ghidra installer uses `C:\Tools` by default. The Visual Studio bridge uses `C:\tools` by default. Both installers accept a `-ToolsRoot` argument when run directly.
 
@@ -46,8 +46,12 @@ The Ghidra installer uses `C:\Tools` by default. The Visual Studio bridge uses `
 
 # Visual Studio bridge for Antigravity only
 .\Setup-Visual-Studio-MCP.ps1 -Client Antigravity
+
+# Either project for OpenCode only
+.\Setup-GhidraMCP-Codex-Dynamic-v7.ps1 -Client OpenCode
+.\Setup-Visual-Studio-MCP.ps1 -Client OpenCode
 ```
 
 ## Add another MCP project
 
-Keep the installer in this folder and add one checkbox plus its launch entry in `Start-MCP-Installer.ps1`. The installer should accept the shared `-Client Codex,Antigravity,ClaudeCode` convention (or `-Client All`), preserve unrelated MCP entries, and verify its final configuration.
+Keep the installer in this folder and add one checkbox plus its launch entry in `Start-MCP-Installer.ps1`. The installer should accept the shared `-Client Codex,Antigravity,ClaudeCode,OpenCode` convention (or `-Client All`), preserve unrelated MCP entries, and verify its final configuration.

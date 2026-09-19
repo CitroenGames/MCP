@@ -92,14 +92,20 @@ $clients.Controls.Add($codex)
 $antigravity = New-Object Windows.Forms.CheckBox
 $antigravity.Text = 'Antigravity CLI'
 $antigravity.AutoSize = $true
-$antigravity.Location = New-Object Drawing.Point(155, 30)
+$antigravity.Location = New-Object Drawing.Point(120, 30)
 $clients.Controls.Add($antigravity)
 
 $claudeCode = New-Object Windows.Forms.CheckBox
 $claudeCode.Text = 'Claude Code'
 $claudeCode.AutoSize = $true
-$claudeCode.Location = New-Object Drawing.Point(350, 30)
 $clients.Controls.Add($claudeCode)
+$claudeCode.Location = New-Object Drawing.Point(280, 30)
+
+$openCode = New-Object Windows.Forms.CheckBox
+$openCode.Text = 'OpenCode'
+$openCode.AutoSize = $true
+$openCode.Location = New-Object Drawing.Point(420, 30)
+$clients.Controls.Add($openCode)
 
 $install = New-Object Windows.Forms.Button
 $install.Text = 'Run selected installers'
@@ -127,6 +133,7 @@ $selectedClients = @()
 if ($codex.Checked) { $selectedClients += 'Codex' }
 if ($antigravity.Checked) { $selectedClients += 'Antigravity' }
 if ($claudeCode.Checked) { $selectedClients += 'ClaudeCode' }
+if ($openCode.Checked) { $selectedClients += 'OpenCode' }
 if ($selectedClients.Count -eq 0) {
     [Windows.Forms.MessageBox]::Show('Choose at least one client platform.', 'MCP Installer Hub', 'OK', 'Warning') | Out-Null
     exit 1

@@ -10,6 +10,7 @@ The script:
   - installs the extension, Windows service, and managed Python runtime;
   - optionally clones the matching source tag under C:\tools;
   - replaces any old Codex HTTP entry with a reliable STDIO entry;
+  - registers the STDIO bridge with Codex, Antigravity, Claude Code, and/or OpenCode;
   - performs a real MCP initialize handshake.
 
 Visual Studio must be closed while the installer runs. The script elevates itself
@@ -43,15 +44,15 @@ function Test-SelectedClient {
 }
 
 function Assert-SelectedClients {
-    $validClients = @('Codex', 'Antigravity', 'ClaudeCode', 'Both', 'All')
+    $validClients = @('Codex', 'Antigravity', 'ClaudeCode', 'OpenCode', 'Both', 'All')
     $requestedClients = @($Client | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
     if ($requestedClients.Count -eq 0) {
-        throw 'Choose at least one client: Codex, Antigravity, or ClaudeCode.'
+        throw 'Choose at least one client: Codex, Antigravity, ClaudeCode, or OpenCode.'
     }
     $invalidClients = @($requestedClients |
         Where-Object { $_ -and $_ -notin $validClients })
     if ($invalidClients.Count -gt 0) {
-        throw "Unknown client selection: $($invalidClients -join ', '). Choose Codex, Antigravity, ClaudeCode, or All."
+        throw "Unknown client selection: $($invalidClients -join ', '). Choose Codex, Antigravity, ClaudeCode, OpenCode, or All."
     }
 }
 
@@ -62,12 +63,13 @@ function Write-Step {
 
 function Show-Usage {
     @'
-VS IDE Bridge setup for Codex, Antigravity CLI, and Claude Code
+VS IDE Bridge setup for Codex, Antigravity CLI, Claude Code, and OpenCode
 
 Usage:
   .\Setup-Visual-Studio-MCP.ps1
   .\Setup-Visual-Studio-MCP.ps1 -Client Antigravity
   .\Setup-Visual-Studio-MCP.ps1 -Client Codex,ClaudeCode
+  .\Setup-Visual-Studio-MCP.ps1 -Client OpenCode
   .\Setup-Visual-Studio-MCP.ps1 -Client All
   .\Setup-Visual-Studio-MCP.ps1 -SkipSourceClone
   .\Setup-Visual-Studio-MCP.ps1 -ToolsRoot D:\tools
@@ -79,6 +81,7 @@ Defaults:
   Config:   %USERPROFILE%\.codex\config.toml
   Antigravity config: %USERPROFILE%\.gemini\config\mcp_config.json
   Claude Code: user-scoped MCP configuration managed by the claude CLI
+  OpenCode config: %USERPROFILE%\.config\opencode\opencode.json
 
 Close Visual Studio before running. Approve the UAC prompt when requested.
 '@ | Write-Host
@@ -703,6 +706,173 @@ function Set-ClaudeCodeBridgeConfiguration {
     return 'Claude Code user MCP configuration'
 }
 
+function Get-OpenCodeConfigPath {
+    if (-not [string]::IsNullOrWhiteSpace($env:OPENCODE_CONFIG)) {
+        $custom = $env:OPENCODE_CONFIG.Trim().Trim('"')
+        if (Test-Path -LiteralPath $custom -PathType Container) {
+            return (Join-Path $custom 'opencode.json')
+        }
+        if ($custom -match '\.jsonc?$') {
+            return $custom
+        }
+        return $custom
+    }
+    return (Join-Path $env:USERPROFILE '.config\opencode\opencode.json')
+}
+
+function ConvertFrom-OpenCodeJson {
+    param([Parameter(Mandatory)][string]$RawContent)
+
+    try {
+        return $RawContent | ConvertFrom-Json
+    }
+    catch {
+        # opencode.json supports JSONC (comments). Strip // line comments and
+        # /* */ block comments, then retry once before giving up.
+        $stripped = [regex]::Replace($RawContent, '(?m)(?<!https:)(?<!http:)//.*$', '')
+        $stripped = [regex]::Replace($stripped, '/\*.*?\*/', '', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+        return $stripped | ConvertFrom-Json
+    }
+}
+
+function Set-OpenCodeBridgeConfiguration {
+    param([string]$ServiceExecutable)
+
+    Write-Step 'Configuring OpenCode STDIO transport'
+    $configPath = Get-OpenCodeConfigPath
+    $configDirectory = Split-Path -Parent $configPath
+    if ([string]::IsNullOrWhiteSpace($configDirectory)) {
+        throw "Could not resolve the OpenCode config directory from: $configPath"
+    }
+    New-Item -ItemType Directory -Path $configDirectory -Force | Out-Null
+
+    $root = $null
+    if (Test-Path -LiteralPath $configPath) {
+        $existing = [IO.File]::ReadAllText($configPath)
+        if (-not [string]::IsNullOrWhiteSpace($existing)) {
+            try {
+                $root = ConvertFrom-OpenCodeJson -RawContent $existing
+            }
+            catch {
+                throw "OpenCode config is not valid JSON and was left unchanged: $configPath. $($_.Exception.Message)"
+            }
+        }
+    }
+    if ($null -eq $root) {
+        $root = New-Object PSObject
+    }
+    if ($root -is [Array] -or $root -is [string] -or $root -is [ValueType]) {
+        throw "OpenCode config must contain a JSON object and was left unchanged: $configPath"
+    }
+
+    # OpenCode v1 uses a flat "mcp": { "<name>": {...} } object, while v2 nests
+    # servers under "mcp": { "servers": { "<name>": {...} } }. Write the entry
+    # to both locations so the bridge works regardless of the installed version.
+    $mcpProperty = $root.PSObject.Properties['mcp']
+    if ($null -eq $mcpProperty -or $null -eq $mcpProperty.Value) {
+        $mcpObject = New-Object PSObject
+        $root | Add-Member -MemberType NoteProperty -Name 'mcp' -Value $mcpObject -Force
+    }
+    else {
+        $mcpObject = $mcpProperty.Value
+        if ($mcpObject -is [Array] -or $mcpObject -is [string] -or $mcpObject -is [ValueType]) {
+            throw "OpenCode mcp section must be a JSON object and was left unchanged: $configPath"
+        }
+    }
+
+    $bridgeEntry = [pscustomobject][ordered]@{
+        type = 'local'
+        command = @($ServiceExecutable, 'mcp-server')
+        enabled = $true
+    }
+    $mcpObject | Add-Member -MemberType NoteProperty -Name 'vs-ide-bridge' `
+        -Value $bridgeEntry -Force
+
+    $serversProperty = $mcpObject.PSObject.Properties['servers']
+    if ($null -eq $serversProperty -or $null -eq $serversProperty.Value) {
+        $serversObject = New-Object PSObject
+        $mcpObject | Add-Member -MemberType NoteProperty -Name 'servers' -Value $serversObject -Force
+    }
+    else {
+        $serversObject = $serversProperty.Value
+        if ($serversObject -is [Array] -or $serversObject -is [string] -or $serversObject -is [ValueType]) {
+            throw "OpenCode mcp.servers must be a JSON object and was left unchanged: $configPath"
+        }
+    }
+    $serversObject | Add-Member -MemberType NoteProperty -Name 'vs-ide-bridge' `
+        -Value ([pscustomobject][ordered]@{
+            type = 'local'
+            command = @($ServiceExecutable, 'mcp-server')
+            enabled = $true
+        }) -Force
+
+    $updated = ($root | ConvertTo-Json -Depth 30) + "`r`n"
+    if (-not (Test-Path -LiteralPath $configPath) -or [IO.File]::ReadAllText($configPath) -ne $updated) {
+        if (Test-Path -LiteralPath $configPath) {
+            $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+            $backupPath = $configPath + '.backup-' + $timestamp
+            Copy-Item -LiteralPath $configPath -Destination $backupPath
+            Write-Host "Backed up the previous OpenCode config to $backupPath"
+        }
+
+        $utf8WithoutBom = New-Object Text.UTF8Encoding($false)
+        $temporaryConfigPath = $configPath + '.new-' + [Guid]::NewGuid().ToString('N')
+        try {
+            [IO.File]::WriteAllText($temporaryConfigPath, $updated, $utf8WithoutBom)
+            Move-Item -LiteralPath $temporaryConfigPath -Destination $configPath -Force
+        }
+        finally {
+            if (Test-Path -LiteralPath $temporaryConfigPath) {
+                Remove-Item -LiteralPath $temporaryConfigPath -Force
+            }
+        }
+    }
+
+    # Read the result back so a write or serialization failure is caught now.
+    $readback = ConvertFrom-OpenCodeJson -RawContent ([IO.File]::ReadAllText($configPath))
+    $flatEntry = $readback.mcp.PSObject.Properties['vs-ide-bridge']
+    $nestedEntry = $null
+    $serversReadback = $readback.mcp.PSObject.Properties['servers']
+    if ($null -ne $serversReadback -and $null -ne $serversReadback.Value) {
+        $nestedEntry = $serversReadback.Value.PSObject.Properties['vs-ide-bridge']
+    }
+    $validEntry = $false
+    foreach ($candidate in @($flatEntry, $nestedEntry)) {
+        if ($null -ne $candidate -and $candidate.Value.type -eq 'local' -and `
+            @($candidate.Value.command).Count -eq 2 -and `
+            $candidate.Value.command[0] -eq $ServiceExecutable -and `
+            $candidate.Value.command[1] -eq 'mcp-server') {
+            $validEntry = $true
+        }
+    }
+    if (-not $validEntry) {
+        throw 'OpenCode configuration readback did not contain the expected vs-ide-bridge entry.'
+    }
+
+    $opencodeCommand = Get-Command opencode -ErrorAction SilentlyContinue
+    if ($null -ne $opencodeCommand) {
+        $opencodePath = if ($opencodeCommand.Source) { $opencodeCommand.Source } else { $opencodeCommand.Path }
+        try {
+            $listOutput = & $opencodePath mcp list 2>&1 | Out-String
+            if ($LASTEXITCODE -eq 0 -and $listOutput -notmatch 'vs-ide-bridge') {
+                Write-Warning "OpenCode config was updated, but 'opencode mcp list' does not show 'vs-ide-bridge' yet. Restart OpenCode and retry 'opencode mcp list'."
+            }
+            elseif ($LASTEXITCODE -eq 0) {
+                Write-Host "OpenCode CLI confirms 'vs-ide-bridge' is listed."
+            }
+        }
+        catch {
+            Write-Warning "OpenCode config was updated, but 'opencode mcp list' could not be verified: $($_.Exception.Message)"
+        }
+    }
+    else {
+        Write-Host 'OpenCode CLI was not found in PATH; configuration was verified by reading the JSON file back.'
+    }
+
+    Write-Host "OpenCode config: $configPath"
+    return $configPath
+}
+
 function Test-StdioHandshake {
     param([string]$ServiceExecutable)
 
@@ -827,6 +997,10 @@ function Main {
     if (Test-SelectedClient -Name 'ClaudeCode') {
         $claudeCodeConfig = Set-ClaudeCodeBridgeConfiguration -ServiceExecutable $serviceExecutable
         $configuredClients.Add("Claude Code: $claudeCodeConfig")
+    }
+    if (Test-SelectedClient -Name 'OpenCode') {
+        $openCodeConfigPath = Set-OpenCodeBridgeConfiguration -ServiceExecutable $serviceExecutable
+        $configuredClients.Add("OpenCode: $openCodeConfigPath")
     }
     Test-StdioHandshake -ServiceExecutable $serviceExecutable
 
